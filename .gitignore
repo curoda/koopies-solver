@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
+demo_*.csv
+*_pressure.csv
+*_report.json
+*_fibonacci_pqr.csv
+patch_dft_output*
+prolate.csv
