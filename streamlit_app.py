@@ -64,6 +64,36 @@ def build_prolate_geometry(n: int, a_center: float, ratio: float, w_mult: int) -
     )
 
 
+def surface_triangulation(xyz: np.ndarray) -> np.ndarray | None:
+    """Build watertight triangle connectivity for a star-shaped point cloud.
+
+    All built-in radiators (sphere, prolate spheroid) are star-shaped about
+    their centroid: every surface point is visible along a ray from the
+    centroid. Taking the convex hull of the *unit direction* vectors from the
+    centroid yields a consistent, closed triangulation of the original points,
+    which renders as an opaque surface (correct hidden-line occlusion) even
+    for elongated bodies where a plain convex hull of the points would skip
+    the high-curvature poles.
+
+    Returns an (n_tri, 3) int array of vertex indices into ``xyz``, or ``None``
+    if a hull cannot be built (e.g. degenerate or non-star-shaped uploads).
+    """
+    if xyz is None or len(xyz) < 4:
+        return None
+    try:
+        from scipy.spatial import ConvexHull
+        centroid = xyz.mean(axis=0)
+        dirs = xyz - centroid
+        norms = np.linalg.norm(dirs, axis=1)
+        if np.any(norms <= 1e-12):
+            return None
+        dirs = dirs / norms[:, None]
+        hull = ConvexHull(dirs)
+        return hull.simplices.astype(int)
+    except Exception:
+        return None
+
+
 def geometry_from_upload(file, a: float) -> solver.Geometry:
     df = pd.read_csv(file)
     columns = set(df.columns)
@@ -198,21 +228,47 @@ if run:
 
     colL, colR = st.columns([3, 2])
 
-    # ---- 3D surface-pressure scatter ----
+    # ---- 3D surface-pressure render ----
     with colL:
         st.subheader("Surface pressure |p|")
+        solid_surface = st.checkbox(
+            "Solid surface (hidden lines, opaque)",
+            value=True,
+            help="Render an opaque triangulated surface so you cannot see "
+                 "through the body. Uncheck for the see-through point cloud.",
+        )
         pdf = pd.DataFrame({
             "x": geom.xyz[:, 0], "y": geom.xyz[:, 1], "z": geom.xyz[:, 2],
             "p_abs": np.abs(p), "patch": model.labels,
         })
         try:
             import plotly.graph_objects as go
-            fig = go.Figure(data=[go.Scatter3d(
-                x=pdf["x"], y=pdf["y"], z=pdf["z"],
-                mode="markers",
-                marker=dict(size=3, color=pdf["p_abs"], colorscale="Viridis",
-                            colorbar=dict(title="|p|"), showscale=True),
-            )])
+            p_abs = np.abs(p)
+            tris = surface_triangulation(geom.xyz) if solid_surface else None
+            if tris is not None and len(tris):
+                fig = go.Figure(data=[go.Mesh3d(
+                    x=geom.xyz[:, 0], y=geom.xyz[:, 1], z=geom.xyz[:, 2],
+                    i=tris[:, 0], j=tris[:, 1], k=tris[:, 2],
+                    intensity=p_abs, colorscale="Viridis",
+                    colorbar=dict(title="|p|"), showscale=True,
+                    opacity=1.0, flatshading=False,
+                    lighting=dict(ambient=0.55, diffuse=0.6, specular=0.2,
+                                  roughness=0.9, fresnel=0.1),
+                    lightposition=dict(x=100, y=200, z=300),
+                    name="|p|",
+                )])
+            else:
+                if solid_surface:
+                    st.caption(
+                        "Could not triangulate this geometry into a closed "
+                        "surface; showing the point cloud instead."
+                    )
+                fig = go.Figure(data=[go.Scatter3d(
+                    x=pdf["x"], y=pdf["y"], z=pdf["z"],
+                    mode="markers",
+                    marker=dict(size=3, color=pdf["p_abs"], colorscale="Viridis",
+                                colorbar=dict(title="|p|"), showscale=True),
+                )])
             fig.update_layout(scene=dict(aspectmode="data"), margin=dict(l=0, r=0, t=0, b=0), height=560)
             st.plotly_chart(fig, use_container_width=True)
         except Exception:
