@@ -265,11 +265,19 @@ if "results" in st.session_state:
     # ---- 3D surface-pressure render ----
     with colL:
         st.subheader("Surface pressure |p|")
-        solid_surface = st.checkbox(
-            "Solid surface (hidden lines, opaque)",
-            value=True,
-            help="Render an opaque triangulated surface so you cannot see "
-                 "through the body. Uncheck for the see-through point cloud.",
+        view_mode = st.radio(
+            "Display mode",
+            [
+                "Points (hide back-facing)",
+                "Points (see-through)",
+                "Solid surface",
+            ],
+            index=0,
+            help="'Hide back-facing' shows only the points in your direct "
+                 "line of sight: an invisible solid hull occludes points on "
+                 "the far side, and it updates as you rotate. 'See-through' "
+                 "shows every point. 'Solid surface' shows the opaque shaded "
+                 "mesh colored by |p|.",
         )
         pdf = pd.DataFrame({
             "x": xyz[:, 0], "y": xyz[:, 1], "z": xyz[:, 2],
@@ -278,9 +286,12 @@ if "results" in st.session_state:
         try:
             import plotly.graph_objects as go
             p_abs = np.abs(p)
-            tris = surface_triangulation(xyz) if solid_surface else None
-            if tris is not None and len(tris):
-                fig = go.Figure(data=[go.Mesh3d(
+            BG = "white"  # occluder + scene background share this color
+            tris = surface_triangulation(xyz)
+            traces = []
+
+            if view_mode == "Solid surface" and tris is not None and len(tris):
+                traces.append(go.Mesh3d(
                     x=xyz[:, 0], y=xyz[:, 1], z=xyz[:, 2],
                     i=tris[:, 0], j=tris[:, 1], k=tris[:, 2],
                     intensity=p_abs, colorscale="Viridis",
@@ -290,20 +301,44 @@ if "results" in st.session_state:
                                   roughness=0.9, fresnel=0.1),
                     lightposition=dict(x=100, y=200, z=300),
                     name="|p|",
-                )])
+                ))
             else:
-                if solid_surface:
+                hide_back = (view_mode == "Points (hide back-facing)")
+                if hide_back and tris is not None and len(tris):
+                    # Invisible (background-colored) solid hull, shrunk very
+                    # slightly toward the centroid so it sits just inside the
+                    # points. The WebGL depth buffer then hides points behind
+                    # it (the far side), live as the user rotates, while the
+                    # front-facing points stay visible.
+                    centroid = xyz.mean(axis=0)
+                    occ = centroid + (xyz - centroid) * 0.995
+                    traces.append(go.Mesh3d(
+                        x=occ[:, 0], y=occ[:, 1], z=occ[:, 2],
+                        i=tris[:, 0], j=tris[:, 1], k=tris[:, 2],
+                        color=BG, opacity=1.0, flatshading=True,
+                        lighting=dict(ambient=1.0, diffuse=0.0, specular=0.0),
+                        hoverinfo="skip", showscale=False, name="occluder",
+                    ))
+                elif hide_back:
                     st.caption(
                         "Could not triangulate this geometry into a closed "
-                        "surface; showing the point cloud instead."
+                        "surface; showing all points instead."
                     )
-                fig = go.Figure(data=[go.Scatter3d(
+                traces.append(go.Scatter3d(
                     x=pdf["x"], y=pdf["y"], z=pdf["z"],
                     mode="markers",
                     marker=dict(size=3, color=pdf["p_abs"], colorscale="Viridis",
                                 colorbar=dict(title="|p|"), showscale=True),
-                )])
-            fig.update_layout(scene=dict(aspectmode="data"), margin=dict(l=0, r=0, t=0, b=0), height=560)
+                    name="|p|",
+                ))
+
+            fig = go.Figure(data=traces)
+            axis_bg = dict(backgroundcolor=BG, showbackground=True,
+                           gridcolor="rgba(0,0,0,0.08)", zerolinecolor="rgba(0,0,0,0.15)")
+            fig.update_layout(
+                scene=dict(aspectmode="data", xaxis=axis_bg, yaxis=axis_bg, zaxis=axis_bg),
+                paper_bgcolor=BG, margin=dict(l=0, r=0, t=0, b=0), height=560,
+            )
             st.plotly_chart(fig, use_container_width=True)
         except Exception:
             st.scatter_chart(pdf, x="x", y="z", color="p_abs")
