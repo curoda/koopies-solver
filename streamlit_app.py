@@ -94,8 +94,14 @@ def surface_triangulation(xyz: np.ndarray) -> np.ndarray | None:
         return None
 
 
-def geometry_from_upload(file, a: float) -> solver.Geometry:
+def geometry_from_upload(file, a: float, max_points: int | None = None) -> solver.Geometry:
     df = pd.read_csv(file)
+    if max_points is not None and len(df) > max_points:
+        # Deterministic random subsample so big assemblies stay tractable.
+        rng = np.random.default_rng(0)
+        keep = rng.choice(len(df), size=int(max_points), replace=False)
+        keep.sort()
+        df = df.iloc[keep].reset_index(drop=True)
     columns = set(df.columns)
     idx_col = "N" if "N" in columns else ("index" if "index" in columns else None)
     index = df[idx_col].to_numpy() if idx_col else np.arange(1, len(df) + 1)
@@ -139,6 +145,43 @@ with st.sidebar:
         sphere_radius = st.number_input("Sphere radius a", value=1.0, min_value=1e-6, format="%.6g")
     else:
         uploaded = st.file_uploader("CSV with x,y,z,vn[,nx,ny,nz,area]", type=["csv"])
+        upload_max_points = None
+        if uploaded is not None:
+            # Peek at the row count without committing to a solve. Large or
+            # multi-component clouds make the adaptive refinement scale badly,
+            # so warn up front and offer a downsample cap.
+            try:
+                _peek = pd.read_csv(uploaded)
+                uploaded.seek(0)  # rewind so the real read still works
+                _n_rows = len(_peek)
+                _components = (
+                    _peek["component"].nunique()
+                    if "component" in _peek.columns else 1
+                )
+            except Exception:
+                _n_rows, _components = None, 1
+
+            if _n_rows is not None:
+                st.caption(f"Loaded {_n_rows:,} points across {_components} component(s).")
+                if _components > 1:
+                    st.warning(
+                        "This file has multiple components. The solver assumes a "
+                        "single closed star-shaped body, so multi-part assemblies "
+                        "may be slow or inaccurate."
+                    )
+                if _n_rows > 1500:
+                    st.warning(
+                        f"{_n_rows:,} points is large. Solve time grows super-linearly "
+                        "on complex geometry (a few thousand scattered points can take "
+                        "minutes). Consider downsampling below."
+                    )
+                if st.checkbox("Downsample before solving", value=(_n_rows > 1500)):
+                    upload_max_points = st.slider(
+                        "Max points to solve", 120,
+                        int(min(max(_n_rows, 240), 4000)),
+                        int(min(_n_rows, 1500)), step=60,
+                        help="Randomly subsamples the uploaded points to this many before solving.",
+                    )
 
     st.header("Acoustic / solver variables")
     ka = st.number_input("ka  (dimensionless wave number)", value=1.0, format="%.6g")
@@ -222,7 +265,8 @@ def make_geometry():
         return build_sphere_geometry(int(n_points), float(sphere_radius))
     if uploaded is None:
         return None
-    return geometry_from_upload(uploaded, float(a_scale))
+    cap = upload_max_points if "upload_max_points" in globals() else None
+    return geometry_from_upload(uploaded, float(a_scale), max_points=cap)
 
 
 # ---------------------------------------------------------------------------
@@ -248,30 +292,51 @@ if run:
             logs.append(str(msg))
 
     solver.log = capture_log  # capture solver's internal logging
+    import time as _time
+    n_pts = len(geom.xyz)
+    if n_pts > 1500:
+        st.info(
+            f"Solving {n_pts:,} points. Large/complex geometry can take a while "
+            "(a few thousand scattered points may run for minutes). Progress below."
+        )
+    status = st.status("Starting...", expanded=True)
     try:
         try:
             m_schedule = solver.parse_m_schedule(m_schedule_text)
         except Exception:
             m_schedule = (8, 12, 16, 24, 32, 48, 64)
-        with st.spinner("Building patch-DFT model and solving by GMRES..."):
-            model = solver.build_model(
-                geom=geom, ka=float(ka), a=float(a_scale), W=int(W),
-                B_user=(int(B_user) if B_user else None),
-                M_user=(int(M_user) if M_user else None),
-                near_threshold=float(near_threshold),
-                self_d_model=self_d_model,
-                lambda_velocity=(float(lambda_velocity) if lambda_velocity else None),
-                patches_per_wavelength=float(patches_per_wavelength),
-                max_patch_diameter=(float(max_patch_diameter) if max_patch_diameter else None),
-                max_normal_angle_deg=float(max_normal_angle_deg),
-                min_points_per_patch=int(min_points_per_patch),
-                far_error_tol=float(far_error_tol),
-                m_schedule=m_schedule,
-                disable_adaptive_M=bool(disable_adaptive_M),
-                verbose=True,
-            )
-            p, stats = solver.solve_pressure(model, rtol=float(rtol), maxiter=int(maxiter), verbose=True)
-            metrics = solver.compute_outputs(model, p)
+
+        _t0 = _time.time()
+        status.update(label="Building patch-DFT model...", state="running")
+        model = solver.build_model(
+            geom=geom, ka=float(ka), a=float(a_scale), W=int(W),
+            B_user=(int(B_user) if B_user else None),
+            M_user=(int(M_user) if M_user else None),
+            near_threshold=float(near_threshold),
+            self_d_model=self_d_model,
+            lambda_velocity=(float(lambda_velocity) if lambda_velocity else None),
+            patches_per_wavelength=float(patches_per_wavelength),
+            max_patch_diameter=(float(max_patch_diameter) if max_patch_diameter else None),
+            max_normal_angle_deg=float(max_normal_angle_deg),
+            min_points_per_patch=int(min_points_per_patch),
+            far_error_tol=float(far_error_tol),
+            m_schedule=m_schedule,
+            disable_adaptive_M=bool(disable_adaptive_M),
+            verbose=True,
+        )
+        _t_model = _time.time() - _t0
+        status.write(f"Model built in {_t_model:.1f}s (B={int(model.B)} patches).")
+
+        status.update(label="Solving boundary equation by GMRES...", state="running")
+        _t1 = _time.time()
+        p, stats = solver.solve_pressure(model, rtol=float(rtol), maxiter=int(maxiter), verbose=True)
+        _t_solve = _time.time() - _t1
+        status.write(f"Solved in {_t_solve:.1f}s.")
+
+        metrics = solver.compute_outputs(model, p)
+        status.update(
+            label=f"Done in {_time.time() - _t0:.1f}s total.", state="complete", expanded=False,
+        )
     finally:
         solver.log = orig_log
 
