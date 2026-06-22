@@ -31,6 +31,22 @@ where:
 This is a research prototype. It is intended to make the logic transparent
 and to support parametric studies. It is not yet a production BEM code.
 
+Adaptive patch/version notes
+----------------------------
+This version keeps the original validated formulation but adds:
+    1. Patch-diameter control: patches are recursively split until
+       d_patch <= lambda_star / patches_per_wavelength, where
+       lambda_star = min(lambda_acoustic, lambda_velocity) if lambda_velocity
+       is supplied.
+    2. Sharp-edge protection: if the CSV contains a face/region identifier
+       column, patches are never allowed to contain points from different
+       regions. If no such column is supplied, a normal-spread criterion is
+       used as a geometric fallback.
+    3. Adaptive M: each patch may use its own local basis size. The code
+       increases M through a user-selectable schedule until the measured
+       far-block projection error for both S and D is below tolerance, or
+       until the schedule / number of points is exhausted.
+
 Expected CSV input columns
 --------------------------
 Required:
@@ -67,7 +83,7 @@ import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Sequence
 
 import numpy as np
 import pandas as pd
@@ -143,6 +159,8 @@ class Geometry:
     area: np.ndarray
     vn: np.ndarray
     digital_lmn: Optional[np.ndarray]
+    patch_region: Optional[np.ndarray] = None
+    patch_region_name: Optional[str] = None
 
 
 def estimate_normals_pca(xyz: np.ndarray, k_neighbors: int = 20) -> np.ndarray:
@@ -212,7 +230,30 @@ def load_geometry(csv_path: Path, a: float, verbose: bool = True) -> Geometry:
         digital_lmn = df[["l", "m", "n"]].to_numpy(dtype=float)
         log("Found digitized l,m,n coordinates; they will be carried to output.", verbose)
 
-    return Geometry(index=index, xyz=xyz, normals=normals, area=area, vn=vn, digital_lmn=digital_lmn)
+    # Optional sharp-edge / surface-region protection. If the mesh/CSV provides
+    # a face or region identifier, each final compression patch is restricted
+    # to a single such region so it cannot cross a modeled sharp edge.
+    region_candidates = [
+        "face_id", "face", "surface_id", "surface", "region_id", "region",
+        "component_id", "component", "edge_group", "patch_region", "part_id", "part",
+    ]
+    patch_region = None
+    patch_region_name = None
+    for col in region_candidates:
+        if col in df.columns:
+            codes, uniques = pd.factorize(df[col], sort=True)
+            patch_region = codes.astype(int)
+            patch_region_name = col
+            log(f"Using '{col}' as the sharp-edge/surface-region patch boundary column "
+                f"({len(uniques)} regions).", verbose)
+            break
+    if patch_region is None:
+        log("No face/region boundary column found. Sharp-edge prevention will use normal-spread splitting.", verbose)
+
+    return Geometry(
+        index=index, xyz=xyz, normals=normals, area=area, vn=vn, digital_lmn=digital_lmn,
+        patch_region=patch_region, patch_region_name=patch_region_name,
+    )
 
 
 # -----------------------------
@@ -250,6 +291,160 @@ def farthest_point_patches(xyz: np.ndarray, b: int, verbose: bool = True) -> Tup
     log(f"Patch assignment complete: B={b}, min/mean/max patch sizes = "
         f"{counts.min()}/{counts.mean():.1f}/{counts.max()}", verbose)
     return labels, centers_idx
+
+
+def max_pairwise_diameter(xyz: np.ndarray, inds: np.ndarray) -> float:
+    """Exact maximum Euclidean point-to-point diameter of one patch."""
+    if len(inds) <= 1:
+        return 0.0
+    pts = xyz[inds]
+    diff = pts[:, None, :] - pts[None, :, :]
+    return float(np.sqrt(np.max(np.sum(diff * diff, axis=2))))
+
+
+def normal_spread_angle(normals: np.ndarray, inds: np.ndarray) -> float:
+    """Maximum angular spread of point normals inside one patch, radians."""
+    if len(inds) <= 1:
+        return 0.0
+    n = normals[inds]
+    mean = n.mean(axis=0)
+    mean /= np.linalg.norm(mean) + 1e-15
+    dots = np.clip(n @ mean, -1.0, 1.0)
+    return float(np.max(np.arccos(dots)))
+
+
+def split_indices_by_farthest_pair(xyz: np.ndarray, inds: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """Split a point set into two children using the farthest pair as seeds."""
+    if len(inds) <= 1:
+        return inds, np.array([], dtype=int)
+    pts = xyz[inds]
+    diff = pts[:, None, :] - pts[None, :, :]
+    d2 = np.sum(diff * diff, axis=2)
+    i0, i1 = np.unravel_index(int(np.argmax(d2)), d2.shape)
+    seed0 = pts[i0]
+    seed1 = pts[i1]
+    d0 = np.sum((pts - seed0) ** 2, axis=1)
+    d1 = np.sum((pts - seed1) ** 2, axis=1)
+    mask = d0 <= d1
+    if np.all(mask) or not np.any(mask):
+        order = np.argsort(pts[:, 0] + 0.37 * pts[:, 1] + 0.19 * pts[:, 2])
+        half = len(inds) // 2
+        left = inds[order[:half]]
+        right = inds[order[half:]]
+    else:
+        left = inds[mask]
+        right = inds[~mask]
+    return left.astype(int), right.astype(int)
+
+
+def relabel_from_patch_lists(patch_lists: Sequence[np.ndarray], n_points: int) -> np.ndarray:
+    labels = np.empty(n_points, dtype=int)
+    for b, inds in enumerate(patch_lists):
+        labels[np.asarray(inds, dtype=int)] = b
+    return labels
+
+
+def initial_patch_lists_by_region(geom: Geometry, requested_B: int, verbose: bool = True) -> List[np.ndarray]:
+    """Create initial patch lists, respecting explicit region/face boundaries if present."""
+    N = geom.xyz.shape[0]
+    patch_lists: List[np.ndarray] = []
+    if geom.patch_region is None:
+        labels, _ = farthest_point_patches(geom.xyz, requested_B, verbose=verbose)
+        return [np.where(labels == b)[0] for b in range(len(np.unique(labels)))]
+
+    # Allocate a requested number of initial patches to each region in proportion
+    # to point count, with at least one patch per nonempty region.
+    regions = np.unique(geom.patch_region)
+    counts = {int(r): int(np.sum(geom.patch_region == r)) for r in regions}
+    total = float(N)
+    allocation = {r: max(1, int(round(requested_B * counts[int(r)] / total))) for r in regions}
+    # Correct any rounding excess/deficit while preserving at least one per region.
+    while sum(allocation.values()) > requested_B and any(v > 1 for v in allocation.values()):
+        r = max(allocation, key=lambda rr: allocation[rr])
+        if allocation[r] > 1:
+            allocation[r] -= 1
+        else:
+            break
+    while sum(allocation.values()) < requested_B:
+        r = max(allocation, key=lambda rr: counts[int(rr)] / allocation[rr])
+        allocation[r] += 1
+
+    for r in regions:
+        inds = np.where(geom.patch_region == r)[0]
+        br = min(allocation[int(r)], len(inds))
+        if br <= 1:
+            patch_lists.append(inds.astype(int))
+        else:
+            labels_local, _ = farthest_point_patches(geom.xyz[inds], br, verbose=False)
+            for b in range(br):
+                patch_lists.append(inds[np.where(labels_local == b)[0]].astype(int))
+    log(f"Initial region-respecting patch assignment complete: B={len(patch_lists)}", verbose)
+    return [p for p in patch_lists if len(p) > 0]
+
+
+def refine_patches_by_diameter_and_edges(
+    geom: Geometry,
+    initial_B: int,
+    max_patch_diameter: Optional[float],
+    min_points_per_patch: int = 1,
+    max_normal_angle_rad: float = math.radians(35.0),
+    max_refine_passes: int = 50,
+    verbose: bool = True,
+) -> Tuple[np.ndarray, List[Dict[str, float]]]:
+    """Refine patch lists until wavelength diameter and edge criteria are met.
+
+    A supplied face/region column is a hard boundary because initial patches are
+    created within regions. Without that column, patches with large normal
+    spread are split as a practical edge/corner safeguard.
+    """
+    patch_lists = initial_patch_lists_by_region(geom, initial_B, verbose=verbose)
+    for pass_id in range(max_refine_passes):
+        changed = False
+        new_lists: List[np.ndarray] = []
+        for inds in patch_lists:
+            d = max_pairwise_diameter(geom.xyz, inds)
+            angle = normal_spread_angle(geom.normals, inds)
+            too_large = max_patch_diameter is not None and d > max_patch_diameter
+            crosses_region = False
+            if geom.patch_region is not None:
+                crosses_region = len(np.unique(geom.patch_region[inds])) > 1
+            crosses_edge_by_normals = geom.patch_region is None and angle > max_normal_angle_rad
+            can_split = len(inds) >= max(2, 2 * min_points_per_patch)
+            if (too_large or crosses_region or crosses_edge_by_normals) and can_split:
+                if crosses_region:
+                    for r in np.unique(geom.patch_region[inds]):
+                        rinds = inds[geom.patch_region[inds] == r]
+                        if len(rinds) > 0:
+                            new_lists.append(rinds.astype(int))
+                else:
+                    left, right = split_indices_by_farthest_pair(geom.xyz, inds)
+                    if len(left) >= min_points_per_patch and len(right) >= min_points_per_patch:
+                        new_lists.extend([left, right])
+                    else:
+                        new_lists.append(inds)
+                changed = True
+            else:
+                new_lists.append(inds)
+        patch_lists = [p for p in new_lists if len(p) > 0]
+        if not changed:
+            break
+    labels = relabel_from_patch_lists(patch_lists, geom.xyz.shape[0])
+    summary = []
+    for b, inds in enumerate(patch_lists):
+        summary.append({
+            "patch": int(b),
+            "n_points": int(len(inds)),
+            "diameter": float(max_pairwise_diameter(geom.xyz, inds)),
+            "normal_spread_deg": float(math.degrees(normal_spread_angle(geom.normals, inds))),
+            "region": int(geom.patch_region[inds[0]]) if geom.patch_region is not None and len(inds) else -1,
+        })
+    counts = np.bincount(labels, minlength=len(patch_lists))
+    diameters = np.array([r["diameter"] for r in summary]) if summary else np.array([0.0])
+    log(f"Refined patches: B={len(patch_lists)}, min/mean/max sizes = "
+        f"{counts.min()}/{counts.mean():.1f}/{counts.max()}", verbose)
+    if max_patch_diameter is not None:
+        log(f"Patch diameter target={max_patch_diameter:.6g}; max observed={diameters.max():.6g}", verbose)
+    return labels, summary
 
 
 # -----------------------------
@@ -296,6 +491,10 @@ class PatchBasis:
     normal: np.ndarray
     basis: np.ndarray        # Q matrix, shape n_patch x r
     directions: np.ndarray   # global directions, shape M x 3
+    M_requested: int
+    diameter: float = 0.0
+    normal_spread_deg: float = 0.0
+    region: int = -1
 
 
 # -----------------------------
@@ -326,6 +525,12 @@ class SolverModel:
     near_blocks: int
     far_blocks: int
     pqr: np.ndarray
+    lambda_acoustic: float
+    lambda_velocity: Optional[float]
+    lambda_star: float
+    max_patch_diameter_target: Optional[float]
+    patch_summary: List[Dict[str, float]]
+    far_error_summary: Dict[str, float]
 
 
 def self_radius_from_area(area: np.ndarray) -> np.ndarray:
@@ -411,11 +616,41 @@ def green_blocks_exact(
     return S, D
 
 
+def build_one_patch_basis(
+    geom: Geometry,
+    inds: np.ndarray,
+    M: int,
+    k: float,
+) -> PatchBasis:
+    """Build one local QR basis for a patch with its own M."""
+    inds = np.asarray(inds, dtype=int)
+    center = geom.xyz[inds].mean(axis=0)
+    normal = geom.normals[inds].mean(axis=0)
+    normal /= np.linalg.norm(normal) + 1e-15
+    M_eff = int(max(1, min(M, len(inds))))
+    base_dirs = fibonacci_directions(M_eff)
+    dirs = rotated_directions(base_dirs, normal)
+    local = geom.xyz[inds] - center
+    G = np.exp(-1j * k * (local @ dirs.T))
+    Q, _ = np.linalg.qr(G, mode="reduced")
+    return PatchBasis(
+        indices=inds,
+        center=center,
+        normal=normal,
+        basis=Q,
+        directions=dirs,
+        M_requested=M_eff,
+        diameter=max_pairwise_diameter(geom.xyz, inds),
+        normal_spread_deg=math.degrees(normal_spread_angle(geom.normals, inds)),
+        region=int(geom.patch_region[inds[0]]) if geom.patch_region is not None and len(inds) else -1,
+    )
+
+
 def build_patch_basis(
     geom: Geometry,
     labels: np.ndarray,
     B: int,
-    base_dirs: np.ndarray,
+    M_per_patch: Sequence[int],
     k: float,
     verbose: bool = True,
 ) -> List[PatchBasis]:
@@ -424,18 +659,128 @@ def build_patch_basis(
         inds = np.where(labels == b)[0]
         if len(inds) == 0:
             continue
-        center = geom.xyz[inds].mean(axis=0)
-        normal = geom.normals[inds].mean(axis=0)
-        normal /= np.linalg.norm(normal) + 1e-15
-        dirs = rotated_directions(base_dirs, normal)
-        local = geom.xyz[inds] - center
-        G = np.exp(-1j * k * (local @ dirs.T))
-        # Economy QR: columns of Q are orthonormal, rank <= min(n_patch, M)
-        Q, _ = np.linalg.qr(G, mode="reduced")
-        patches.append(PatchBasis(indices=inds, center=center, normal=normal, basis=Q, directions=dirs))
+        patches.append(build_one_patch_basis(geom, inds, int(M_per_patch[b]), k))
     if len(patches) != B:
         log(f"WARNING: requested B={B}, but only built {len(patches)} non-empty patches.", verbose)
     return patches
+
+
+def parse_m_schedule(text: str) -> List[int]:
+    vals = []
+    for part in text.replace(";", ",").split(","):
+        part = part.strip()
+        if part:
+            vals.append(int(part))
+    vals = sorted(set(v for v in vals if v > 0))
+    if not vals:
+        raise ValueError("M schedule cannot be empty.")
+    return vals
+
+
+def nearest_schedule_value(m: int, schedule: Sequence[int], nmax: int) -> int:
+    candidates = [min(v, nmax) for v in schedule if v >= m]
+    if candidates:
+        return int(max(1, min(candidates[0], nmax)))
+    return int(max(1, min(max(schedule), nmax)))
+
+
+def next_schedule_value(m: int, schedule: Sequence[int], nmax: int) -> int:
+    for v in schedule:
+        vv = int(min(v, nmax))
+        if vv > m:
+            return vv
+    return int(m)
+
+
+def initial_m_for_patch(n_points: int, k: float, diameter: float, schedule: Sequence[int], M_user: Optional[int]) -> int:
+    if M_user is not None:
+        return int(max(1, min(M_user, n_points)))
+    kd = abs(k) * diameter
+    estimate = int(math.ceil(4.0 * (1.0 + kd) ** 2))
+    estimate = max(8, estimate)
+    return nearest_schedule_value(estimate, schedule, n_points)
+
+
+def projection_error(A: np.ndarray, Qa: np.ndarray, Qb: np.ndarray) -> float:
+    denom = np.linalg.norm(A, ord="fro") + 1e-30
+    Acomp = Qa @ (Qa.conj().T @ A @ Qb) @ Qb.conj().T
+    return float(np.linalg.norm(A - Acomp, ord="fro") / denom)
+
+
+def adapt_patch_bases_by_far_error(
+    geom: Geometry,
+    labels: np.ndarray,
+    patches: List[PatchBasis],
+    k: float,
+    near_threshold: float,
+    self_d_model: str,
+    m_schedule: Sequence[int],
+    far_error_tol: float,
+    max_adapt_passes: int = 8,
+    verbose: bool = True,
+) -> Tuple[List[PatchBasis], Dict[str, float]]:
+    """Increase per-patch M until far-block S and D projection errors satisfy tolerance."""
+    centroid = geom.xyz.mean(axis=0)
+    B = len(patches)
+    last_errors: List[Tuple[float, float]] = []
+    for pass_id in range(max_adapt_passes):
+        changed = False
+        worst_S = 0.0
+        worst_D = 0.0
+        sum_S = 0.0
+        sum_D = 0.0
+        n_far = 0
+        for a_idx, pa in enumerate(patches):
+            for b_idx, pb in enumerate(patches):
+                sep = patch_center_angle_or_distance(pa, pb, centroid)
+                is_near = (a_idx == b_idx) or (sep < near_threshold)
+                if is_near:
+                    continue
+                S_exact, D_exact = green_blocks_exact(
+                    geom.xyz, geom.normals, geom.area,
+                    pa.indices, pb.indices, k, self_d_model=self_d_model,
+                )
+                eS = projection_error(S_exact, pa.basis, pb.basis)
+                eD = projection_error(D_exact, pa.basis, pb.basis)
+                err = max(eS, eD)
+                worst_S = max(worst_S, eS)
+                worst_D = max(worst_D, eD)
+                sum_S += eS
+                sum_D += eD
+                n_far += 1
+                if err > far_error_tol:
+                    new_a = next_schedule_value(pa.M_requested, m_schedule, len(pa.indices))
+                    new_b = next_schedule_value(pb.M_requested, m_schedule, len(pb.indices))
+                    # Increase the smaller/available side first, then both if possible.
+                    if new_a > pa.M_requested and (pa.M_requested <= pb.M_requested or new_b == pb.M_requested):
+                        patches[a_idx] = build_one_patch_basis(geom, pa.indices, new_a, k)
+                        changed = True
+                    elif new_b > pb.M_requested:
+                        patches[b_idx] = build_one_patch_basis(geom, pb.indices, new_b, k)
+                        changed = True
+                    elif new_a > pa.M_requested:
+                        patches[a_idx] = build_one_patch_basis(geom, pa.indices, new_a, k)
+                        changed = True
+        mean_S = sum_S / max(n_far, 1)
+        mean_D = sum_D / max(n_far, 1)
+        last_errors.append((worst_S, worst_D))
+        log(f"Adaptive M pass {pass_id + 1}: far blocks={n_far}, "
+            f"max error S={worst_S:.3e}, D={worst_D:.3e}; "
+            f"mean S={mean_S:.3e}, D={mean_D:.3e}; "
+            f"M range={min(p.M_requested for p in patches)}-{max(p.M_requested for p in patches)}", verbose)
+        if not changed or max(worst_S, worst_D) <= far_error_tol:
+            break
+    Mvals = np.array([p.M_requested for p in patches], dtype=int)
+    summary = {
+        "far_error_tol": float(far_error_tol),
+        "far_error_max_S": float(last_errors[-1][0] if last_errors else 0.0),
+        "far_error_max_D": float(last_errors[-1][1] if last_errors else 0.0),
+        "M_min": int(Mvals.min()) if len(Mvals) else 0,
+        "M_mean": float(Mvals.mean()) if len(Mvals) else 0.0,
+        "M_max": int(Mvals.max()) if len(Mvals) else 0,
+        "adaptive_passes": int(len(last_errors)),
+    }
+    return patches, summary
 
 
 def patch_center_angle_or_distance(pa: PatchBasis, pb: PatchBasis, centroid: np.ndarray) -> float:
@@ -459,46 +804,86 @@ def build_model(
     M_user: Optional[int] = None,
     near_threshold: float = 0.75,
     self_d_model: str = "cap",
+    lambda_velocity: Optional[float] = None,
+    patches_per_wavelength: float = 6.0,
+    max_patch_diameter: Optional[float] = None,
+    max_normal_angle_deg: float = 35.0,
+    min_points_per_patch: int = 1,
+    far_error_tol: float = 1e-4,
+    m_schedule: Sequence[int] = (8, 12, 16, 24, 32, 48, 64),
+    disable_adaptive_M: bool = False,
     verbose: bool = True,
 ) -> SolverModel:
     N = geom.xyz.shape[0]
     k = ka / a
-    B = B_user if B_user is not None else auto_patch_count(N)
+    lambda_acoustic = 2.0 * np.pi / abs(k) if abs(k) > 0 else np.inf
+    lambda_star = min(lambda_acoustic, lambda_velocity) if lambda_velocity is not None else lambda_acoustic
+    if max_patch_diameter is None and np.isfinite(lambda_star):
+        max_patch_diameter = lambda_star / patches_per_wavelength
+
+    B0 = B_user if B_user is not None else auto_patch_count(N)
     log("\n--- Patch-DFT Green setup ---", verbose)
     log(f"Input points N={N}", verbose)
     log(f"ka={ka:g}, a={a:g}, physical wave number k=ka/a={k:g}", verbose)
+    log(f"lambda_acoustic={lambda_acoustic:.6g}; lambda_velocity={lambda_velocity}; lambda_star={lambda_star:.6g}", verbose)
+    log(f"Patch-diameter target d_max <= {max_patch_diameter:.6g} "
+        f"({patches_per_wavelength:g} patches per shortest wavelength)", verbose)
     log(f"Digital multiplier W={W}", verbose)
-    log(f"Automatic/requested patch count B={B}", verbose)
+    log(f"Initial automatic/requested patch count B0={B0}", verbose)
 
-    labels, _ = farthest_point_patches(geom.xyz, B, verbose=verbose)
-    # Remove empty patches by relabeling if any.
+    labels, patch_summary = refine_patches_by_diameter_and_edges(
+        geom=geom,
+        initial_B=B0,
+        max_patch_diameter=max_patch_diameter,
+        min_points_per_patch=min_points_per_patch,
+        max_normal_angle_rad=math.radians(max_normal_angle_deg),
+        verbose=verbose,
+    )
     unique = np.unique(labels)
     remap = {old: new for new, old in enumerate(unique)}
     labels = np.array([remap[x] for x in labels], dtype=int)
     B = len(unique)
     counts = np.bincount(labels, minlength=B)
-    avg_patch = float(np.mean(counts))
-    if M_user is None:
-        # M is the number of local plane-wave/DFT components used for far blocks.
-        # Choose a value that is not too large for the available patch points.
-        M = int(max(8, min(32, round(0.7 * avg_patch))))
+    log(f"Final patch sizes min/mean/max = {counts.min()}/{counts.mean():.1f}/{counts.max()}", verbose)
+
+    # Per-patch initial M. This replaces the old global M-only rule, but still
+    # respects --M when supplied by using it as the fixed requested starting value.
+    m_schedule = sorted(set(int(v) for v in m_schedule if int(v) > 0))
+    if not m_schedule:
+        raise ValueError("m_schedule cannot be empty")
+    M_per_patch = []
+    for b in range(B):
+        inds = np.where(labels == b)[0]
+        d = max_pairwise_diameter(geom.xyz, inds)
+        M_per_patch.append(initial_m_for_patch(len(inds), k, d, m_schedule, M_user))
+    log(f"Initial M range = {min(M_per_patch)}-{max(M_per_patch)}", verbose)
+
+    patches = build_patch_basis(geom, labels, B, M_per_patch, k, verbose=verbose)
+    if disable_adaptive_M:
+        far_error_summary = {
+            "far_error_tol": float(far_error_tol), "far_error_max_S": np.nan, "far_error_max_D": np.nan,
+            "M_min": int(min(M_per_patch)), "M_mean": float(np.mean(M_per_patch)),
+            "M_max": int(max(M_per_patch)), "adaptive_passes": 0,
+        }
+        log("Adaptive far-block M control disabled by user.", verbose)
     else:
-        M = int(M_user)
-    log(f"Patch sizes min/mean/max = {counts.min()}/{counts.mean():.1f}/{counts.max()}", verbose)
-    log(f"Plane-wave/DFT modes per far block M={M}", verbose)
+        patches, far_error_summary = adapt_patch_bases_by_far_error(
+            geom=geom, labels=labels, patches=patches, k=k,
+            near_threshold=near_threshold, self_d_model=self_d_model,
+            m_schedule=m_schedule, far_error_tol=far_error_tol, verbose=verbose,
+        )
 
-    base_dirs = fibonacci_directions(M)
-    pqr = digital_pqr_from_dirs(base_dirs, W)
-    log("Generated local plane-wave direction catalog by Fibonacci sphere.", verbose)
-    log(f"First five digital (p,q,r) directions with W={W}: {pqr[:5].tolist()}", verbose)
+    # Keep a global pqr catalog for compatibility/output. Actual patches may use
+    # fewer or more directions according to PatchBasis.M_requested.
+    M_report = int(max(p.M_requested for p in patches)) if patches else 0
+    pqr = digital_pqr_from_dirs(fibonacci_directions(max(M_report, 1)), W)[:M_report]
+    log(f"Final adaptive M range = {min(p.M_requested for p in patches)}-{max(p.M_requested for p in patches)}", verbose)
 
-    patches = build_patch_basis(geom, labels, B, base_dirs, k, verbose=verbose)
     centroid = geom.xyz.mean(axis=0)
-
     blocks: List[Block] = []
     near_count = 0
     far_count = 0
-    log("Building patch-patch blocks...", verbose)
+    log("Building final patch-patch blocks...", verbose)
     for a_idx, pa in enumerate(patches):
         for b_idx, pb in enumerate(patches):
             sep = patch_center_angle_or_distance(pa, pb, centroid)
@@ -513,16 +898,32 @@ def build_model(
             else:
                 Ga = pa.basis
                 Gb = pb.basis
-                # Small dense spectral core. This is the DFT-compressed far-block interaction.
                 S_core = Ga.conj().T @ S_exact @ Gb
                 D_core = Ga.conj().T @ D_exact @ Gb
                 blocks.append(Block(a_idx, b_idx, "far", S_core, D_core))
                 far_count += 1
     log(f"Blocks built: near/self dense={near_count}, far DFT-compressed={far_count}", verbose)
+
+    # Refresh patch summary with final M values.
+    patch_summary = []
+    for b, patch in enumerate(patches):
+        patch_summary.append({
+            "patch": int(b),
+            "n_points": int(len(patch.indices)),
+            "diameter": float(patch.diameter),
+            "normal_spread_deg": float(patch.normal_spread_deg),
+            "region": int(patch.region),
+            "M_requested": int(patch.M_requested),
+            "rank_stored": int(patch.basis.shape[1]),
+        })
+
     return SolverModel(
-        geom=geom, ka=ka, a=a, k=k, W=W, B=B, M=M,
+        geom=geom, ka=ka, a=a, k=k, W=W, B=B, M=M_report,
         labels=labels, patches=patches, blocks=blocks,
         near_blocks=near_count, far_blocks=far_count, pqr=pqr,
+        lambda_acoustic=float(lambda_acoustic), lambda_velocity=lambda_velocity,
+        lambda_star=float(lambda_star), max_patch_diameter_target=max_patch_diameter,
+        patch_summary=patch_summary, far_error_summary=far_error_summary,
     )
 
 
@@ -622,23 +1023,33 @@ def save_outputs(model: SolverModel, p: np.ndarray, stats: Dict[str, float], met
     pqr_path = Path(str(out_prefix) + "_fibonacci_pqr.csv")
     pqr_df.to_csv(pqr_path, index=False)
 
+    patch_path = Path(str(out_prefix) + "_patch_summary.csv")
+    pd.DataFrame(model.patch_summary).to_csv(patch_path, index=False)
+
     Z = metrics["surface_impedance"]
     report = {
         "N_points": int(len(g.index)),
         "B_patches": int(model.B),
-        "M_plane_wave_terms_per_far_block": int(model.M),
+        "M_plane_wave_terms_max_per_far_block": int(model.M),
         "W_multiplier": int(model.W),
         "ka": float(model.ka),
         "a": float(model.a),
         "k": float(model.k),
+        "lambda_acoustic": float(model.lambda_acoustic),
+        "lambda_velocity": None if model.lambda_velocity is None else float(model.lambda_velocity),
+        "lambda_star": float(model.lambda_star),
+        "max_patch_diameter_target": None if model.max_patch_diameter_target is None else float(model.max_patch_diameter_target),
         "near_blocks_dense": int(model.near_blocks),
         "far_blocks_dft_compressed": int(model.far_blocks),
+        "far_block_error_control": model.far_error_summary,
         "gmres": stats,
         "surface_impedance_real": float(np.real(Z)),
         "surface_impedance_imag": float(np.imag(Z)),
         "radiated_power_rhoc1": metrics["radiated_power_rhoc1"],
         "notes": [
-            "This prototype uses dense near/self Green blocks and DFT-compressed far blocks.",
+            "This version uses dense near/self Green blocks and DFT-compressed far blocks.",
+            "Patch count is refined by maximum patch diameter and sharp-edge/normal-spread controls.",
+            "Far-block M is selected adaptively from measured S and D projection error unless disabled.",
             "If nx,ny,nz or area were not supplied, estimates were used; provide them for production accuracy.",
             "Pressure normalization assumes rho*c = 1. Multiply by rho*c for physical pressure units if velocity is in m/s.",
         ],
@@ -649,6 +1060,7 @@ def save_outputs(model: SolverModel, p: np.ndarray, stats: Dict[str, float], met
 
     log(f"Saved pressure results: {pressure_path}", verbose)
     log(f"Saved Fibonacci digital directions: {pqr_path}", verbose)
+    log(f"Saved patch summary: {patch_path}", verbose)
     log(f"Saved run report: {report_path}", verbose)
 
 
@@ -663,7 +1075,15 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--a", type=float, default=1.0, help="Typical radiator length/radius a, same units as x,y,z")
     parser.add_argument("--W", type=int, default=100, help="Digital DFT rounding multiplier for p,q,r directions")
     parser.add_argument("--B", type=int, default=None, help="Number of patches. If omitted, chosen automatically from N")
-    parser.add_argument("--M", type=int, default=None, help="Plane-wave/DFT modes per far block. If omitted, chosen from patch size")
+    parser.add_argument("--M", type=int, default=None, help="Initial/requested local plane-wave modes. If omitted, chosen from k*d_patch and then adapted")
+    parser.add_argument("--lambda-v", type=float, default=None, help="Shortest wavelength in the prescribed surface-velocity pattern, same units as x,y,z")
+    parser.add_argument("--patches-per-wavelength", type=float, default=6.0, help="Patch-diameter rule: d_patch <= lambda_star / this value")
+    parser.add_argument("--max-patch-diameter", type=float, default=None, help="Direct patch-diameter limit. Overrides lambda_star/patches_per_wavelength when supplied")
+    parser.add_argument("--max-normal-angle-deg", type=float, default=35.0, help="Fallback sharp-edge split: split patches whose normal spread exceeds this angle when no face/region column exists")
+    parser.add_argument("--min-points-per-patch", type=int, default=1, help="Do not split below this many points per child patch")
+    parser.add_argument("--far-error-tol", type=float, default=1e-4, help="Measured far-block projection error tolerance for both S and D")
+    parser.add_argument("--M-schedule", default="8,12,16,24,32,48,64", help="Comma-separated candidate M values for adaptive far-block control")
+    parser.add_argument("--disable-adaptive-M", action="store_true", help="Use initial M values only; do not increase M by measured far-block error")
     parser.add_argument("--near-threshold", type=float, default=0.75, help="Near-block threshold. For closed bodies near sphere, radians about centroid")
     parser.add_argument("--self-d-model", choices=["zero", "cap"], default="cap", help="Self-cell correction for D operator")
     parser.add_argument("--rtol", type=float, default=1e-5, help="GMRES relative tolerance")
@@ -686,7 +1106,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     geom = load_geometry(Path(args.input_csv), a=args.a, verbose=verbose)
     model = build_model(
         geom=geom, ka=args.ka, a=args.a, W=args.W, B_user=args.B, M_user=args.M,
-        near_threshold=args.near_threshold, self_d_model=args.self_d_model, verbose=verbose,
+        near_threshold=args.near_threshold, self_d_model=args.self_d_model,
+        lambda_velocity=args.lambda_v, patches_per_wavelength=args.patches_per_wavelength,
+        max_patch_diameter=args.max_patch_diameter, max_normal_angle_deg=args.max_normal_angle_deg,
+        min_points_per_patch=args.min_points_per_patch, far_error_tol=args.far_error_tol,
+        m_schedule=parse_m_schedule(args.M_schedule), disable_adaptive_M=args.disable_adaptive_M,
+        verbose=verbose,
     )
     p, stats = solve_pressure(model, rtol=args.rtol, maxiter=args.maxiter, verbose=verbose)
     metrics = compute_outputs(model, p)

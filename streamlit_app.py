@@ -153,6 +153,52 @@ with st.sidebar:
     near_threshold = st.slider("Near-block threshold (rad about centroid)", 0.0, 3.14159, 0.75, step=0.05)
     self_d_model = st.selectbox("Self-cell D correction", ["cap", "zero"], index=0)
 
+    st.subheader("Adaptive refinement")
+    st.caption(
+        "Patches are recursively split until small enough, sharp edges are "
+        "protected, and each patch can grow its own basis size M until the "
+        "far-block projection error is below tolerance."
+    )
+    patches_per_wavelength = st.number_input(
+        "Patches per shortest wavelength", value=6.0, min_value=1.0, step=0.5, format="%.1f",
+        help="Patch diameter target = shortest wavelength / this value. Higher = finer patches.",
+    )
+    max_diam_on = st.checkbox("Override max patch diameter", value=False)
+    max_patch_diameter = (
+        st.number_input("Max patch diameter (length units)", value=1.0, min_value=1e-6, format="%.6g")
+        if max_diam_on else None
+    )
+    max_normal_angle_deg = st.slider(
+        "Max normal spread per patch (deg, edge protection)", 5.0, 90.0, 35.0, step=5.0,
+        help="Patches whose normals spread beyond this angle are split. Guards sharp edges/corners.",
+    )
+    min_points_per_patch = st.number_input(
+        "Min points per patch", value=1, min_value=1, step=1,
+    )
+    vel_lambda_on = st.checkbox("Specify velocity wavelength", value=False,
+        help="If the prescribed normal velocity varies on a length scale shorter than "
+             "the acoustic wavelength, set it here so patches resolve it too.")
+    lambda_velocity = (
+        st.number_input("Velocity wavelength (length units)", value=1.0, min_value=1e-6, format="%.6g")
+        if vel_lambda_on else None
+    )
+
+    disable_adaptive_M = not st.checkbox(
+        "Adaptive M (grow basis until far-error tol)", value=True,
+        help="When on, each patch grows its plane-wave basis M through the schedule "
+             "until the far-block projection error is below tolerance.",
+    )
+    far_error_tol = st.select_slider(
+        "Far-block projection error tolerance",
+        options=[1e-2, 1e-3, 1e-4, 1e-5, 1e-6],
+        value=1e-4,
+        format_func=lambda v: f"{v:.0e}",
+    )
+    m_schedule_text = st.text_input(
+        "M schedule (comma-separated)", value="8, 12, 16, 24, 32, 48, 64",
+        help="Ascending basis sizes the adaptive-M search steps through.",
+    )
+
     st.subheader("GMRES")
     rtol = st.select_slider(
         "Relative tolerance",
@@ -203,13 +249,26 @@ if run:
 
     solver.log = capture_log  # capture solver's internal logging
     try:
+        try:
+            m_schedule = solver.parse_m_schedule(m_schedule_text)
+        except Exception:
+            m_schedule = (8, 12, 16, 24, 32, 48, 64)
         with st.spinner("Building patch-DFT model and solving by GMRES..."):
             model = solver.build_model(
                 geom=geom, ka=float(ka), a=float(a_scale), W=int(W),
                 B_user=(int(B_user) if B_user else None),
                 M_user=(int(M_user) if M_user else None),
                 near_threshold=float(near_threshold),
-                self_d_model=self_d_model, verbose=True,
+                self_d_model=self_d_model,
+                lambda_velocity=(float(lambda_velocity) if lambda_velocity else None),
+                patches_per_wavelength=float(patches_per_wavelength),
+                max_patch_diameter=(float(max_patch_diameter) if max_patch_diameter else None),
+                max_normal_angle_deg=float(max_normal_angle_deg),
+                min_points_per_patch=int(min_points_per_patch),
+                far_error_tol=float(far_error_tol),
+                m_schedule=m_schedule,
+                disable_adaptive_M=bool(disable_adaptive_M),
+                verbose=True,
             )
             p, stats = solver.solve_pressure(model, rtol=float(rtol), maxiter=int(maxiter), verbose=True)
             metrics = solver.compute_outputs(model, p)
@@ -237,6 +296,14 @@ if run:
             "ka": float(model.ka), "a": float(model.a), "k": float(model.k),
             "near_blocks": int(model.near_blocks),
             "far_blocks": int(model.far_blocks),
+            "lambda_acoustic": float(model.lambda_acoustic),
+            "lambda_velocity": (float(model.lambda_velocity)
+                                if model.lambda_velocity is not None else None),
+            "lambda_star": float(model.lambda_star),
+            "max_patch_diameter_target": (float(model.max_patch_diameter_target)
+                                          if model.max_patch_diameter_target is not None else None),
+            "far_error_summary": {k: (float(v) if isinstance(v, (int, float)) else v)
+                                  for k, v in model.far_error_summary.items()},
         },
     }
 
@@ -259,6 +326,18 @@ if "results" in st.session_state:
     c3.metric("Radiated power (rho*c=1)", f"{metrics['radiated_power_rhoc1']:.4e}")
     conv = "converged" if stats["gmres_info"] == 0 else f"info={int(stats['gmres_info'])}"
     c4.metric("GMRES", conv, delta=f"res {stats['relative_residual']:.1e}")
+
+    fes = mi.get("far_error_summary", {})
+    if fes:
+        st.caption(
+            f"Adaptive refinement: {mi['B']} patches, "
+            f"M per patch {int(fes.get('M_min', 0))}\u2013{int(fes.get('M_max', 0))} "
+            f"(mean {fes.get('M_mean', 0):.1f}), "
+            f"far-block error max S={fes.get('far_error_max_S', float('nan')):.1e} / "
+            f"D={fes.get('far_error_max_D', float('nan')):.1e} "
+            f"vs tol {fes.get('far_error_tol', float('nan')):.0e}, "
+            f"{int(fes.get('adaptive_passes', 0))} pass(es)."
+        )
 
     colL, colR = st.columns([3, 2])
 
@@ -354,6 +433,11 @@ if "results" in st.session_state:
             "ka": mi["ka"], "a": mi["a"], "k": mi["k"],
             "near_blocks_dense": mi["near_blocks"],
             "far_blocks_dft_compressed": mi["far_blocks"],
+            "lambda_acoustic": mi["lambda_acoustic"],
+            "lambda_velocity": mi["lambda_velocity"],
+            "lambda_star": mi["lambda_star"],
+            "max_patch_diameter_target": mi["max_patch_diameter_target"],
+            "adaptive": mi["far_error_summary"],
             "gmres": stats,
             "surface_impedance_real": float(np.real(Z)),
             "surface_impedance_imag": float(np.imag(Z)),
