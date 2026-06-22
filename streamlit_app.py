@@ -216,6 +216,40 @@ if run:
     finally:
         solver.log = orig_log
 
+    # Stash everything needed to re-render so widget interactions (e.g. the
+    # display-mode checkbox) don't re-trigger the solve or blank the output.
+    # Streamlit reruns the whole script on every widget change; the "Run
+    # solver" button is only True on its own click, so the results must live
+    # in session_state to survive subsequent reruns.
+    st.session_state["results"] = {
+        "xyz": geom.xyz,
+        "normals": geom.normals,
+        "area": geom.area,
+        "index": geom.index,
+        "vn": geom.vn,
+        "p": p,
+        "labels": model.labels,
+        "stats": stats,
+        "metrics": metrics,
+        "logs": logs,
+        "model_info": {
+            "B": int(model.B), "M": int(model.M), "W": int(model.W),
+            "ka": float(model.ka), "a": float(model.a), "k": float(model.k),
+            "near_blocks": int(model.near_blocks),
+            "far_blocks": int(model.far_blocks),
+        },
+    }
+
+
+if "results" in st.session_state:
+    R = st.session_state["results"]
+    xyz = R["xyz"]
+    p = R["p"]
+    stats = R["stats"]
+    metrics = R["metrics"]
+    logs = R["logs"]
+    labels = R["labels"]
+    mi = R["model_info"]
     Z = metrics["surface_impedance"]
 
     # ---- Top-line metrics ----
@@ -238,16 +272,16 @@ if run:
                  "through the body. Uncheck for the see-through point cloud.",
         )
         pdf = pd.DataFrame({
-            "x": geom.xyz[:, 0], "y": geom.xyz[:, 1], "z": geom.xyz[:, 2],
-            "p_abs": np.abs(p), "patch": model.labels,
+            "x": xyz[:, 0], "y": xyz[:, 1], "z": xyz[:, 2],
+            "p_abs": np.abs(p), "patch": labels,
         })
         try:
             import plotly.graph_objects as go
             p_abs = np.abs(p)
-            tris = surface_triangulation(geom.xyz) if solid_surface else None
+            tris = surface_triangulation(xyz) if solid_surface else None
             if tris is not None and len(tris):
                 fig = go.Figure(data=[go.Mesh3d(
-                    x=geom.xyz[:, 0], y=geom.xyz[:, 1], z=geom.xyz[:, 2],
+                    x=xyz[:, 0], y=xyz[:, 1], z=xyz[:, 2],
                     i=tris[:, 0], j=tris[:, 1], k=tris[:, 2],
                     intensity=p_abs, colorscale="Viridis",
                     colorbar=dict(title="|p|"), showscale=True,
@@ -278,13 +312,13 @@ if run:
     with colR:
         st.subheader("Run report")
         report = {
-            "N_points": int(len(geom.index)),
-            "B_patches": int(model.B),
-            "M_modes_per_far_block": int(model.M),
-            "W": int(model.W),
-            "ka": float(model.ka), "a": float(model.a), "k": float(model.k),
-            "near_blocks_dense": int(model.near_blocks),
-            "far_blocks_dft_compressed": int(model.far_blocks),
+            "N_points": int(len(R["index"])),
+            "B_patches": mi["B"],
+            "M_modes_per_far_block": mi["M"],
+            "W": mi["W"],
+            "ka": mi["ka"], "a": mi["a"], "k": mi["k"],
+            "near_blocks_dense": mi["near_blocks"],
+            "far_blocks_dft_compressed": mi["far_blocks"],
             "gmres": stats,
             "surface_impedance_real": float(np.real(Z)),
             "surface_impedance_imag": float(np.imag(Z)),
@@ -293,14 +327,14 @@ if run:
         st.json(report, expanded=False)
 
         out_df = pd.DataFrame({
-            "N": geom.index,
-            "x": geom.xyz[:, 0], "y": geom.xyz[:, 1], "z": geom.xyz[:, 2],
-            "nx": geom.normals[:, 0], "ny": geom.normals[:, 1], "nz": geom.normals[:, 2],
-            "area": geom.area,
-            "vn_real": np.real(geom.vn), "vn_imag": np.imag(geom.vn),
+            "N": R["index"],
+            "x": xyz[:, 0], "y": xyz[:, 1], "z": xyz[:, 2],
+            "nx": R["normals"][:, 0], "ny": R["normals"][:, 1], "nz": R["normals"][:, 2],
+            "area": R["area"],
+            "vn_real": np.real(R["vn"]), "vn_imag": np.imag(R["vn"]),
             "p_real": np.real(p), "p_imag": np.imag(p),
             "p_abs": np.abs(p), "p_phase_rad": np.angle(p),
-            "patch": model.labels,
+            "patch": labels,
         })
         st.download_button(
             "Download pressure CSV",
