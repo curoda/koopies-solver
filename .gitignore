@@ -8,3 +8,10 @@ demo_*.csv
 *_fibonacci_pqr.csv
 patch_dft_output*
 prolate.csv
+*_resources.jsonl
+*_patch_summary.csv
+*_feature_summary.csv
+streamlit_jobs/
+dft_jobs/
+worker.claim
+finley_data.csv

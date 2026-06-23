@@ -17,7 +17,8 @@ It changes the execution architecture rather than the acoustic formulation:
 * memory estimates and live RSS snapshots are written to a JSONL log;
 * optional LGMRES fallback remains matrix-free;
 * optional dense LAPACK LU fallback is disabled by default and limited to small N;
-* model objects are never serialized and are explicitly released after each case.
+* model objects are never serialized and are explicitly released after each case;
+* preprocessor face/edge/corner/feature metadata are read and enforced as hard patch boundaries.
 
 The validated geometry, patching, Green kernels, self terms, and local DFT
 construction are imported from patch_dft_green_solver_adaptive.py, which must
@@ -59,7 +60,7 @@ HERE = Path(__file__).resolve().parent
 if str(HERE) not in sys.path:
     sys.path.insert(0, str(HERE))
 
-import patch_dft_green_solver as legacy
+import patch_dft_green_solver_adaptive as legacy
 
 try:
     import psutil  # type: ignore
@@ -720,9 +721,9 @@ def build_model_lite(
     if patch_count > max_patch_count:
         raise MemoryBudgetExceeded(
             f"Patch refinement produced B={patch_count}, above the configured "
-            f"maximum {max_patch_count}. Supply face/region identifiers, increase "
-            "the normal-angle limit, or deliberately raise --max-patch-count after "
-            "reviewing the memory estimate."
+            f"maximum {max_patch_count}. Review preprocessor feature-group cardinality "
+            "(especially per-element IDs), increase the normal-angle limit, or "
+            "deliberately raise --max-patch-count after reviewing the memory estimate."
         )
     patch_sizes = np.bincount(labels, minlength=patch_count)
     monitor.snapshot(
@@ -907,20 +908,20 @@ def build_model_lite(
         cap = rank_cap_for_patch(
             n_local, max_rank_fraction, max_rank_absolute
         )
-        patch_summary.append(
-            {
-                "patch": patch_id,
-                "n_points": n_local,
-                "diameter": float(patch.diameter),
-                "normal_spread_deg": float(patch.normal_spread_deg),
-                "region": int(patch.region),
-                "M_requested": int(patch.M_requested),
-                "rank_stored": int(patch.basis.shape[1]),
-                "rank_cap": int(cap),
-                "rank_fraction": float(patch.basis.shape[1] / max(n_local, 1)),
-                "rank_guard_reached": bool(patch.M_requested >= cap),
-            }
-        )
+        patch_record: Dict[str, Any] = {
+            "patch": patch_id,
+            "n_points": n_local,
+            "diameter": float(patch.diameter),
+            "normal_spread_deg": float(patch.normal_spread_deg),
+            "region": int(patch.region),
+            "M_requested": int(patch.M_requested),
+            "rank_stored": int(patch.basis.shape[1]),
+            "rank_cap": int(cap),
+            "rank_fraction": float(patch.basis.shape[1] / max(n_local, 1)),
+            "rank_guard_reached": bool(patch.M_requested >= cap),
+        }
+        patch_record.update(legacy.feature_subset_summary(geom, patch.indices))
+        patch_summary.append(patch_record)
 
     monitor.snapshot(
         "model_complete",
@@ -1317,7 +1318,100 @@ def compute_outputs(
     }
 
 
-def geometry_audit(geom: Geometry) -> Dict[str, Any]:
+def feature_audit(
+    geom: Geometry,
+    patch_labels: Optional[np.ndarray] = None,
+) -> Dict[str, Any]:
+    features = geom.features
+    if features is None:
+        return {
+            "metadata_present": False,
+            "boundary_mode": "off",
+            "hard_group_count": 0,
+            "patches_crossing_hard_feature_boundaries": 0,
+        }
+
+    classes = features.feature_class
+    metadata_group_count = int(len(np.unique(features.group_code)))
+    audit: Dict[str, Any] = {
+        "metadata_present": True,
+        "boundary_mode": features.boundary_mode,
+        "detected_columns": features.detected_columns,
+        "metadata_group_count": metadata_group_count,
+        "hard_group_count": (
+            0 if features.boundary_mode == "off" else metadata_group_count
+        ),
+        "connectivity_radius": float(features.connectivity_radius),
+        "feature_type_map": features.feature_type_map,
+        "zero_feature_id_is_missing": bool(features.zero_feature_id_is_missing),
+        "class_counts": {
+            name: int(np.sum(classes == name))
+            for name in ("surface", "edge", "corner", "feature")
+        },
+        "face_id_count": int(len({value for value in features.face_id if value})),
+        "edge_id_count": int(len({value for value in features.edge_id if value})),
+        "corner_id_count": int(len({value for value in features.corner_id if value})),
+        "feature_id_count": int(len({value for value in features.feature_id if value})),
+    }
+    crossing = 0
+    if patch_labels is not None and features.boundary_mode != "off":
+        for patch_id in np.unique(patch_labels):
+            inds = np.where(patch_labels == patch_id)[0]
+            if len(np.unique(features.group_code[inds])) > 1:
+                crossing += 1
+    audit["patches_crossing_hard_feature_boundaries"] = int(crossing)
+    return audit
+
+
+def feature_group_dataframe(
+    geom: Geometry,
+    patch_labels: Optional[np.ndarray] = None,
+) -> pd.DataFrame:
+    features = geom.features
+    if features is None:
+        return pd.DataFrame(
+            columns=[
+                "feature_group_code", "feature_group_label", "n_points",
+                "area", "patch_count", "feature_class", "feature_type",
+                "face_id", "edge_id", "corner_id", "feature_id",
+            ]
+        )
+
+    records: List[Dict[str, Any]] = []
+    for group_code in np.unique(features.group_code):
+        inds = np.where(features.group_code == group_code)[0]
+        summary = legacy.feature_subset_summary(geom, inds)
+        record: Dict[str, Any] = {
+            "feature_group_code": int(group_code),
+            "feature_group_label": summary["feature_group_label"],
+            "n_points": int(len(inds)),
+            "area": float(np.sum(geom.area[inds])),
+            "patch_count": (
+                int(len(np.unique(patch_labels[inds])))
+                if patch_labels is not None
+                else 0
+            ),
+            "feature_class": summary["feature_class"],
+            "feature_type": summary["feature_type"],
+            "face_id": summary["face_id"],
+            "edge_id": summary["edge_id"],
+            "corner_id": summary["corner_id"],
+            "feature_id": summary["feature_id"],
+            "x_min": float(np.min(geom.xyz[inds, 0])),
+            "x_max": float(np.max(geom.xyz[inds, 0])),
+            "y_min": float(np.min(geom.xyz[inds, 1])),
+            "y_max": float(np.max(geom.xyz[inds, 1])),
+            "z_min": float(np.min(geom.xyz[inds, 2])),
+            "z_max": float(np.max(geom.xyz[inds, 2])),
+        }
+        records.append(record)
+    return pd.DataFrame(records).sort_values("feature_group_code")
+
+
+def geometry_audit(
+    geom: Geometry,
+    patch_labels: Optional[np.ndarray] = None,
+) -> Dict[str, Any]:
     total_area = float(np.sum(geom.area))
     closure_vector = np.sum(geom.area[:, None] * geom.normals, axis=0)
     closure_ratio = float(
@@ -1332,6 +1426,7 @@ def geometry_audit(geom: Geometry) -> Dict[str, Any]:
         "area_min": float(np.min(geom.area)),
         "area_max": float(np.max(geom.area)),
         "area_nonpositive_count": int(np.sum(geom.area <= 0.0)),
+        "feature_metadata": feature_audit(geom, patch_labels),
     }
 
 
@@ -1377,14 +1472,26 @@ def save_outputs(
         result_df.insert(4, "l", geom.digital_lmn[:, 0])
         result_df.insert(5, "m", geom.digital_lmn[:, 1])
         result_df.insert(6, "n", geom.digital_lmn[:, 2])
+    if geom.features is not None:
+        features = geom.features
+        result_df["feature_group_code"] = features.group_code
+        result_df["feature_group_label"] = features.group_label
+        result_df["feature_class"] = features.feature_class
+        result_df["feature_type"] = features.feature_type_raw
+        result_df["face_id"] = features.face_id
+        result_df["edge_id"] = features.edge_id
+        result_df["corner_id"] = features.corner_id
+        result_df["feature_id"] = features.feature_id
 
     pressure_path = Path(str(out_prefix) + "_pressure.csv")
     patch_path = Path(str(out_prefix) + "_patch_summary.csv")
+    feature_path = Path(str(out_prefix) + "_feature_summary.csv")
     pqr_path = Path(str(out_prefix) + "_fibonacci_pqr.csv")
     report_path = Path(str(out_prefix) + "_report.json")
 
     result_df.to_csv(pressure_path, index=False)
     pd.DataFrame(model.patch_summary).to_csv(patch_path, index=False)
+    feature_group_dataframe(geom, model.labels).to_csv(feature_path, index=False)
     pd.DataFrame(model.pqr, columns=["p", "q", "r"]).to_csv(
         pqr_path, index=False
     )
@@ -1411,7 +1518,7 @@ def save_outputs(
         "far_block_error_control": model.far_error_summary,
         "memory_estimate": model.memory_estimate,
         "solver": stats,
-        "geometry_audit": geometry_audit(geom),
+        "geometry_audit": geometry_audit(geom, model.labels),
         "surface_impedance_normalized": {
             "real": float(np.real(z_norm)),
             "imag": float(np.imag(z_norm)),
@@ -1434,16 +1541,19 @@ def save_outputs(
             "S_DFT is applied once to the prescribed normal velocity and S blocks are discarded.",
             "Only final pressure vectors, patch summaries, directions, and reports are saved.",
             "Dense LAPACK LU is disabled by default and is available only as an explicit small-N fallback.",
+            "Preprocessor face, edge, corner, and feature metadata are carried to outputs and used as hard patch boundaries according to feature_boundary_mode.",
         ],
     }
     report_path.write_text(
         json.dumps(report, indent=2, default=_json_default), encoding="utf-8"
     )
     log(f"Saved pressure vector: {pressure_path}", verbose)
+    log(f"Saved feature summary: {feature_path}", verbose)
     log(f"Saved report: {report_path}", verbose)
     return {
         "pressure_csv": str(pressure_path),
         "patch_summary_csv": str(patch_path),
+        "feature_summary_csv": str(feature_path),
         "pqr_csv": str(pqr_path),
         "report_json": str(report_path),
     }
@@ -1466,6 +1576,59 @@ def build_parser() -> argparse.ArgumentParser:
         help="CSV with x,y,z,vn_real/vn_imag and recommended normals/area",
     )
     parser.add_argument("--case-id", default=None)
+    parser.add_argument(
+        "--feature-metadata-csv",
+        default=None,
+        help="Optional separate preprocessor metadata CSV joined to the acoustic input by point ID.",
+    )
+    parser.add_argument(
+        "--feature-geometry-key-column",
+        default=None,
+        help="Point-ID column in the acoustic geometry CSV for a separate metadata join.",
+    )
+    parser.add_argument(
+        "--feature-metadata-key-column",
+        default=None,
+        help="Point-ID column in the separate feature metadata CSV.",
+    )
+    parser.add_argument(
+        "--feature-boundary-mode",
+        choices=["auto", "strict", "face-only", "off"],
+        default="auto",
+        help=(
+            "How preprocessor topology metadata constrains compression patches. "
+            "auto uses strict edge/corner/feature groups when present, otherwise face-only."
+        ),
+    )
+    parser.add_argument("--face-column", default=None, help="Explicit face/surface/region ID column name.")
+    parser.add_argument("--edge-column", default=None, help="Explicit edge ID column name.")
+    parser.add_argument("--corner-column", default=None, help="Explicit corner/vertex ID column name.")
+    parser.add_argument("--feature-type-column", default=None, help="Explicit feature type/class column name.")
+    parser.add_argument(
+        "--feature-type-map",
+        default="",
+        help="Optional code map such as '0:surface,1:edge,2:corner' or a JSON object.",
+    )
+    parser.add_argument("--feature-id-column", default=None, help="Explicit general feature ID column name.")
+    parser.add_argument("--is-edge-column", default=None, help="Optional Boolean edge-flag column name.")
+    parser.add_argument("--is-corner-column", default=None, help="Optional Boolean corner-flag column name.")
+    parser.add_argument(
+        "--feature-zero-id-is-valid",
+        action="store_true",
+        help=(
+            "By default zero edge/corner/general-feature IDs are treated as missing "
+            "sentinels. Set this flag when zero is a real feature identifier."
+        ),
+    )
+    parser.add_argument(
+        "--feature-connectivity-factor",
+        type=float,
+        default=2.5,
+        help=(
+            "When edge/corner points have no IDs, connect points within this multiple "
+            "of the median point spacing to create automatic feature components."
+        ),
+    )
     parser.add_argument(
         "--frequency-hz",
         type=float,
@@ -1584,9 +1747,34 @@ def main(argv: Optional[List[str]] = None) -> int:
     try:
         monitor.snapshot("worker_start")
         geom = legacy.load_geometry(
-            Path(args.input_csv), a=args.a, verbose=verbose
+            Path(args.input_csv),
+            a=args.a,
+            verbose=verbose,
+            face_column=args.face_column,
+            edge_column=args.edge_column,
+            corner_column=args.corner_column,
+            feature_type_column=args.feature_type_column,
+            feature_id_column=args.feature_id_column,
+            is_edge_column=args.is_edge_column,
+            is_corner_column=args.is_corner_column,
+            feature_boundary_mode=args.feature_boundary_mode,
+            feature_connectivity_factor=args.feature_connectivity_factor,
+            feature_metadata_csv=(
+                Path(args.feature_metadata_csv) if args.feature_metadata_csv else None
+            ),
+            feature_geometry_key_column=args.feature_geometry_key_column,
+            feature_metadata_key_column=args.feature_metadata_key_column,
+            zero_feature_id_is_missing=not args.feature_zero_id_is_valid,
+            feature_type_map=args.feature_type_map,
         )
-        monitor.snapshot("geometry_loaded", N=len(geom.index))
+        loaded_feature_audit = feature_audit(geom)
+        monitor.snapshot(
+            "geometry_loaded",
+            N=len(geom.index),
+            feature_metadata_present=loaded_feature_audit.get("metadata_present", False),
+            feature_boundary_mode=loaded_feature_audit.get("boundary_mode", "off"),
+            feature_group_count=loaded_feature_audit.get("hard_group_count", 0),
+        )
 
         if args.frequency_hz is not None:
             k = 2.0 * np.pi * args.frequency_hz / args.c
