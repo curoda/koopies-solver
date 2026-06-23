@@ -307,36 +307,103 @@ if run:
             m_schedule = (8, 12, 16, 24, 32, 48, 64)
 
         _t0 = _time.time()
-        status.update(label="Building patch-DFT model...", state="running")
-        model = solver.build_model(
-            geom=geom, ka=float(ka), a=float(a_scale), W=int(W),
-            B_user=(int(B_user) if B_user else None),
-            M_user=(int(M_user) if M_user else None),
-            near_threshold=float(near_threshold),
-            self_d_model=self_d_model,
-            lambda_velocity=(float(lambda_velocity) if lambda_velocity else None),
-            patches_per_wavelength=float(patches_per_wavelength),
-            max_patch_diameter=(float(max_patch_diameter) if max_patch_diameter else None),
-            max_normal_angle_deg=float(max_normal_angle_deg),
-            min_points_per_patch=int(min_points_per_patch),
-            far_error_tol=float(far_error_tol),
-            m_schedule=m_schedule,
-            disable_adaptive_M=bool(disable_adaptive_M),
-            verbose=True,
-        )
-        _t_model = _time.time() - _t0
-        status.write(f"Model built in {_t_model:.1f}s (B={int(model.B)} patches).")
+        status.update(label="Running out-of-process memory-lean solver...", state="running")
+        
+        import tempfile
+        import subprocess
+        import sys
+        import os
+        
+        with tempfile.TemporaryDirectory() as tmpdir:
+            in_csv = os.path.join(tmpdir, "in.csv")
+            out_prefix = os.path.join(tmpdir, "out")
+            
+            # Write geom to CSV
+            df = pd.DataFrame({
+                "N": geom.index,
+                "x": geom.xyz[:, 0], "y": geom.xyz[:, 1], "z": geom.xyz[:, 2],
+                "nx": geom.normals[:, 0], "ny": geom.normals[:, 1], "nz": geom.normals[:, 2],
+                "area": geom.area,
+                "vn_real": np.real(geom.vn), "vn_imag": np.imag(geom.vn),
+            })
+            if geom.digital_lmn is not None:
+                df["l"] = geom.digital_lmn[:, 0]
+                df["m"] = geom.digital_lmn[:, 1]
+                df["n"] = geom.digital_lmn[:, 2]
+            df.to_csv(in_csv, index=False)
+            
+            cmd = [
+                sys.executable, "dam_dft_solver_streamlit_ready.py", in_csv,
+                "--out", out_prefix,
+                "--ka", str(float(ka)),
+                "--a", str(float(a_scale)),
+                "--W", str(int(W)),
+                "--near-threshold", str(float(near_threshold)),
+                "--self-d-model", self_d_model,
+                "--patches-per-wavelength", str(float(patches_per_wavelength)),
+                "--max-normal-angle-deg", str(float(max_normal_angle_deg)),
+                "--min-points-per-patch", str(int(min_points_per_patch)),
+                "--far-error-tol", str(float(far_error_tol)),
+                "--M-schedule", ",".join(map(str, m_schedule)),
+                "--rtol", str(float(rtol)),
+                "--maxiter", str(int(maxiter)),
+            ]
+            if B_user: cmd.extend(["--B", str(int(B_user))])
+            if M_user: cmd.extend(["--M", str(int(M_user))])
+            if lambda_velocity: cmd.extend(["--lambda-v", str(float(lambda_velocity))])
+            if max_patch_diameter: cmd.extend(["--max-patch-diameter", str(float(max_patch_diameter))])
+            if disable_adaptive_M: cmd.append("--disable-adaptive-M")
+            
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            logs.extend(result.stdout.splitlines())
+            if result.stderr:
+                logs.extend(result.stderr.splitlines())
+                
+            if result.returncode != 0:
+                st.error("Solver process failed. Check the logs.")
+                st.stop()
+                
+            # Read outputs
+            import json
+            with open(out_prefix + "_report.json", "r") as f:
+                report = json.load(f)
+            out_df = pd.read_csv(out_prefix + "_pressure.csv")
+            
+            p = out_df["p_real"].to_numpy() + 1j * out_df["p_imag"].to_numpy()
+            labels = out_df["patch"].to_numpy()
+            
+            # Map report to what session_state expects
+            stats = {
+                "gmres_info": report["solver"]["gmres_info"],
+                "relative_residual": report["solver"]["relative_residual"]
+            }
+            metrics = {
+                "surface_impedance": report["surface_impedance_normalized"]["real"] + 1j * report["surface_impedance_normalized"]["imag"],
+                "radiated_power_rhoc1": report["radiated_power_rhoc1"]
+            }
+            
+            # Fake the model object fields since we don't have it
+            class DummyModel: pass
+            model = DummyModel()
+            model.B = report["B_patches"]
+            model.M = report["M_plane_wave_terms_max_per_far_block"]
+            model.W = report["W_multiplier"]
+            model.ka = report["ka"]
+            model.a = report["a"]
+            model.k = report["k"]
+            model.near_blocks = report["near_blocks_dense"]
+            model.far_blocks = report["far_blocks_dft_compressed"]
+            model.lambda_acoustic = report["lambda_acoustic"]
+            model.lambda_velocity = report["lambda_velocity"]
+            model.lambda_star = report["lambda_star"]
+            model.max_patch_diameter_target = report["max_patch_diameter_target"]
+            model.far_error_summary = report["far_block_error_control"]
+            model.labels = labels
 
-        status.update(label="Solving boundary equation by GMRES...", state="running")
-        _t1 = _time.time()
-        p, stats = solver.solve_pressure(model, rtol=float(rtol), maxiter=int(maxiter), verbose=True)
-        _t_solve = _time.time() - _t1
-        status.write(f"Solved in {_t_solve:.1f}s.")
-
-        metrics = solver.compute_outputs(model, p)
         status.update(
             label=f"Done in {_time.time() - _t0:.1f}s total.", state="complete", expanded=False,
         )
+
     finally:
         solver.log = orig_log
 
