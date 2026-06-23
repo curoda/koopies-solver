@@ -333,7 +333,7 @@ if run:
             df.to_csv(in_csv, index=False)
             
             cmd = [
-                sys.executable, "dam_dft_solver_streamlit_ready.py", in_csv,
+                sys.executable, os.path.join(os.path.dirname(__file__), "dam_dft_solver_streamlit_ready.py"), in_csv,
                 "--out", out_prefix,
                 "--ka", str(float(ka)),
                 "--a", str(float(a_scale)),
