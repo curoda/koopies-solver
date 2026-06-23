@@ -369,7 +369,7 @@ if run:
                 report = json.load(f)
             out_df = pd.read_csv(out_prefix + "_pressure.csv")
             
-            p = out_df["p_real"].to_numpy() + 1j * out_df["p_imag"].to_numpy()
+            p = out_df["p_normalized_real"].to_numpy() + 1j * out_df["p_normalized_imag"].to_numpy()
             labels = out_df["patch"].to_numpy()
             
             # Map report to what session_state expects
