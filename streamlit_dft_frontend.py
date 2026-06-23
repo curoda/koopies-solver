@@ -39,6 +39,171 @@ def safe_name(value: str) -> str:
     return cleaned.strip("._") or "case"
 
 
+def surface_triangulation(xyz):
+    """Build a closed triangulation for a star-shaped point cloud.
+
+    Takes the convex hull of the unit direction vectors from the centroid,
+    which yields a consistent closed surface of the original points even for
+    elongated bodies. Returns an (n_tri, 3) int array of indices into ``xyz``
+    or ``None`` if a hull cannot be built (degenerate or non-star-shaped).
+    """
+    import numpy as np
+    if xyz is None or len(xyz) < 4:
+        return None
+    try:
+        from scipy.spatial import ConvexHull
+        centroid = xyz.mean(axis=0)
+        dirs = xyz - centroid
+        norms = np.linalg.norm(dirs, axis=1)
+        if np.any(norms <= 1e-12):
+            return None
+        dirs = dirs / norms[:, None]
+        hull = ConvexHull(dirs)
+        return hull.simplices.astype(int)
+    except Exception:
+        return None
+
+
+def render_pressure_viewer(job_dir: Path) -> None:
+    """Interactive 3D surface-pressure plot read from result_pressure.csv.
+
+    The worker stays out of process; this only loads the final pressure CSV
+    (no matrices) and renders it with Plotly inside the UI.
+    """
+    import numpy as np
+    import pandas as pd
+
+    pressure_csv = job_dir / "result_pressure.csv"
+    if not pressure_csv.exists():
+        return
+    try:
+        df = pd.read_csv(pressure_csv)
+    except Exception as exc:  # noqa: BLE001
+        st.caption(f"Could not read pressure CSV for plotting: {exc}")
+        return
+    if not all(c in df.columns for c in ("x", "y", "z")):
+        return
+
+    xyz = df[["x", "y", "z"]].to_numpy(dtype=float)
+    if "p_normalized_real" in df.columns and "p_normalized_imag" in df.columns:
+        p_abs = np.abs(
+            df["p_normalized_real"].to_numpy() + 1j * df["p_normalized_imag"].to_numpy()
+        )
+    elif "p_Pa_abs_peak" in df.columns:
+        p_abs = df["p_Pa_abs_peak"].to_numpy(dtype=float)
+    else:
+        return
+
+    st.subheader("Surface pressure |p|")
+    color_options = ["|p| (pressure magnitude)"]
+    if "patch" in df.columns:
+        color_options.append("Patch id")
+    for feat_col in ("feature_class", "feature_group_label"):
+        if feat_col in df.columns:
+            color_options.append(f"Feature: {feat_col}")
+
+    ctrl_l, ctrl_r = st.columns(2)
+    with ctrl_l:
+        view_mode = st.radio(
+            "Display mode",
+            [
+                "Points (hide back-facing)",
+                "Points (see-through)",
+                "Solid surface",
+            ],
+            index=0,
+            key=f"viewmode_{job_dir.name}",
+            help="'Hide back-facing' uses an invisible hull to occlude points "
+                 "on the far side as you rotate. 'See-through' shows every "
+                 "point. 'Solid surface' shows the opaque shaded mesh.",
+        )
+    with ctrl_r:
+        color_by = st.selectbox(
+            "Color by", color_options, index=0, key=f"colorby_{job_dir.name}",
+        )
+
+    if color_by == "|p| (pressure magnitude)":
+        color_values = p_abs
+        colorscale = "Viridis"
+        colorbar_title = "|p|"
+        discrete = False
+    elif color_by == "Patch id":
+        color_values = df["patch"].to_numpy()
+        colorscale = "Turbo"
+        colorbar_title = "patch"
+        discrete = False
+    else:
+        feat_col = color_by.split(": ", 1)[1]
+        raw = df[feat_col].astype(str).fillna("none")
+        categories = {name: i for i, name in enumerate(sorted(raw.unique()))}
+        color_values = raw.map(categories).to_numpy()
+        colorscale = "Turbo"
+        colorbar_title = feat_col
+        discrete = True
+
+    try:
+        import plotly.graph_objects as go
+        BG = "white"
+        tris = surface_triangulation(xyz)
+        traces = []
+
+        if view_mode == "Solid surface" and tris is not None and len(tris):
+            traces.append(go.Mesh3d(
+                x=xyz[:, 0], y=xyz[:, 1], z=xyz[:, 2],
+                i=tris[:, 0], j=tris[:, 1], k=tris[:, 2],
+                intensity=p_abs, colorscale="Viridis",
+                colorbar=dict(title="|p|"), showscale=True,
+                opacity=1.0, flatshading=False,
+                lighting=dict(ambient=0.55, diffuse=0.6, specular=0.2,
+                              roughness=0.9, fresnel=0.1),
+                lightposition=dict(x=100, y=200, z=300),
+                name="|p|",
+            ))
+        else:
+            hide_back = (view_mode == "Points (hide back-facing)")
+            if hide_back and tris is not None and len(tris):
+                centroid = xyz.mean(axis=0)
+                occ = centroid + (xyz - centroid) * 0.995
+                traces.append(go.Mesh3d(
+                    x=occ[:, 0], y=occ[:, 1], z=occ[:, 2],
+                    i=tris[:, 0], j=tris[:, 1], k=tris[:, 2],
+                    color=BG, opacity=1.0, flatshading=True,
+                    lighting=dict(ambient=1.0, diffuse=0.0, specular=0.0),
+                    hoverinfo="skip", showscale=False, name="occluder",
+                ))
+            elif hide_back:
+                st.caption(
+                    "Could not triangulate this geometry into a closed "
+                    "surface; showing all points instead."
+                )
+            traces.append(go.Scatter3d(
+                x=xyz[:, 0], y=xyz[:, 1], z=xyz[:, 2],
+                mode="markers",
+                marker=dict(
+                    size=3, color=color_values, colorscale=colorscale,
+                    colorbar=(None if discrete else dict(title=colorbar_title)),
+                    showscale=not discrete,
+                ),
+                text=[f"|p|={v:.3e}" for v in p_abs],
+                name=colorbar_title,
+            ))
+
+        fig = go.Figure(data=traces)
+        axis_bg = dict(backgroundcolor=BG, showbackground=True,
+                       gridcolor="rgba(0,0,0,0.08)", zerolinecolor="rgba(0,0,0,0.15)")
+        fig.update_layout(
+            scene=dict(aspectmode="data", xaxis=axis_bg, yaxis=axis_bg, zaxis=axis_bg),
+            paper_bgcolor=BG, margin=dict(l=0, r=0, t=0, b=0), height=560,
+        )
+        st.plotly_chart(fig, use_container_width=True, key=f"plot_{job_dir.name}")
+    except Exception as exc:  # noqa: BLE001
+        st.caption(f"3D viewer unavailable ({exc}); showing 2D scatter.")
+        st.scatter_chart(
+            pd.DataFrame({"x": xyz[:, 0], "z": xyz[:, 2], "p_abs": p_abs}),
+            x="x", y="z", color="p_abs",
+        )
+
+
 def atomic_write_json(path: Path, payload: Dict[str, Any]) -> None:
     temporary = path.with_suffix(path.suffix + ".tmp")
     temporary.write_text(json.dumps(payload, indent=2), encoding="utf-8")
@@ -342,6 +507,8 @@ def render_job(job_dir: Path) -> None:
             )
         with st.expander("Run report", expanded=False):
             st.json(report, expanded=False)
+
+    render_pressure_viewer(job_dir)
 
     downloadable = [
         ("Pressure CSV", job_dir / "result_pressure.csv", "text/csv"),
