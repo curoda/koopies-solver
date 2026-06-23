@@ -94,8 +94,11 @@ def surface_triangulation(xyz: np.ndarray) -> np.ndarray | None:
         return None
 
 
-def geometry_from_upload(file, a: float, max_points: int | None = None) -> solver.Geometry:
+def geometry_from_upload(file, a: float, max_points: int | None = None, allowed_components=None) -> solver.Geometry:
     df = pd.read_csv(file)
+    if allowed_components is not None and "component" in df.columns:
+        df = df[df["component"].isin(allowed_components)].reset_index(drop=True)
+        
     if max_points is not None and len(df) > max_points:
         # Deterministic random subsample so big assemblies stay tractable.
         rng = np.random.default_rng(0)
@@ -146,6 +149,7 @@ with st.sidebar:
     else:
         uploaded = st.file_uploader("CSV with x,y,z,vn[,nx,ny,nz,area]", type=["csv"])
         upload_max_points = None
+        upload_components = None
         if uploaded is not None:
             # Peek at the row count without committing to a solve. Large or
             # multi-component clouds make the adaptive refinement scale badly,
@@ -163,13 +167,21 @@ with st.sidebar:
 
             if _n_rows is not None:
                 st.caption(f"Loaded {_n_rows:,} points across {_components} component(s).")
+                
                 if _components > 1:
                     st.warning(
                         "This file has multiple components. The solver assumes a "
                         "single closed star-shaped body, so multi-part assemblies "
                         "may be slow or inaccurate."
                     )
-                if _n_rows > 1500:
+                    if "component" in _peek.columns:
+                        upload_components = st.multiselect(
+                            "Select components to solve",
+                            options=list(_peek["component"].unique()),
+                            default=[_peek["component"].value_counts().idxmax()]
+                        )
+                        _n_rows = len(_peek[_peek["component"].isin(upload_components)])
+                if _n_rows > 1500 and (upload_components is None or len(upload_components) > 0):
                     st.warning(
                         f"{_n_rows:,} points is large. Solve time grows super-linearly "
                         "on complex geometry (a few thousand scattered points can take "
@@ -266,7 +278,8 @@ def make_geometry():
     if uploaded is None:
         return None
     cap = upload_max_points if "upload_max_points" in globals() else None
-    return geometry_from_upload(uploaded, float(a_scale), max_points=cap)
+    allowed_comps = upload_components if "upload_components" in globals() else None
+    return geometry_from_upload(uploaded, float(a_scale), max_points=cap, allowed_components=allowed_comps)
 
 
 # ---------------------------------------------------------------------------
