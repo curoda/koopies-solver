@@ -85,17 +85,29 @@ def render_pressure_viewer(job_dir: Path) -> None:
         return
 
     xyz = df[["x", "y", "z"]].to_numpy(dtype=float)
-    if "p_normalized_real" in df.columns and "p_normalized_imag" in df.columns:
+
+    # Color by physical surface-pressure magnitude in Pascals. Prefer the
+    # worker's peak-amplitude column; otherwise rescale the dimensionless
+    # (rho*c) pressure by rho*c read from the run report.
+    if "p_Pa_abs_peak" in df.columns:
+        p_abs = df["p_Pa_abs_peak"].to_numpy(dtype=float)
+    elif "p_Pa_real" in df.columns and "p_Pa_imag" in df.columns:
         p_abs = np.abs(
+            df["p_Pa_real"].to_numpy() + 1j * df["p_Pa_imag"].to_numpy()
+        )
+    elif "p_normalized_real" in df.columns and "p_normalized_imag" in df.columns:
+        report = load_json(job_dir / "result_report.json") or {}
+        rho = float(report.get("rho_kg_m3", 1.204))
+        c = float(report.get("c_m_s", 343.0))
+        p_norm = np.abs(
             df["p_normalized_real"].to_numpy() + 1j * df["p_normalized_imag"].to_numpy()
         )
-    elif "p_Pa_abs_peak" in df.columns:
-        p_abs = df["p_Pa_abs_peak"].to_numpy(dtype=float)
+        p_abs = (rho * c) * p_norm
     else:
         return
 
-    st.subheader("Surface pressure |p|")
-    color_options = ["|p| (pressure magnitude)"]
+    st.subheader("Surface pressure |p| (Pa)")
+    color_options = ["|p| (Pa)"]
     if "patch" in df.columns:
         color_options.append("Patch id")
     for feat_col in ("feature_class", "feature_group_label"):
@@ -122,10 +134,10 @@ def render_pressure_viewer(job_dir: Path) -> None:
             "Color by", color_options, index=0, key=f"colorby_{job_dir.name}",
         )
 
-    if color_by == "|p| (pressure magnitude)":
+    if color_by == "|p| (Pa)":
         color_values = p_abs
         colorscale = "Viridis"
-        colorbar_title = "|p|"
+        colorbar_title = "|p| (Pa)"
         discrete = False
     elif color_by == "Patch id":
         color_values = df["patch"].to_numpy()
@@ -152,12 +164,12 @@ def render_pressure_viewer(job_dir: Path) -> None:
                 x=xyz[:, 0], y=xyz[:, 1], z=xyz[:, 2],
                 i=tris[:, 0], j=tris[:, 1], k=tris[:, 2],
                 intensity=p_abs, colorscale="Viridis",
-                colorbar=dict(title="|p|"), showscale=True,
+                colorbar=dict(title="|p| (Pa)"), showscale=True,
                 opacity=1.0, flatshading=False,
                 lighting=dict(ambient=0.55, diffuse=0.6, specular=0.2,
                               roughness=0.9, fresnel=0.1),
                 lightposition=dict(x=100, y=200, z=300),
-                name="|p|",
+                name="|p| (Pa)",
             ))
         else:
             hide_back = (view_mode == "Points (hide back-facing)")
@@ -184,7 +196,7 @@ def render_pressure_viewer(job_dir: Path) -> None:
                     colorbar=(None if discrete else dict(title=colorbar_title)),
                     showscale=not discrete,
                 ),
-                text=[f"|p|={v:.3e}" for v in p_abs],
+                text=[f"|p|={v:.3g} Pa" for v in p_abs],
                 name=colorbar_title,
             ))
 
