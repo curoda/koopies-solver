@@ -226,6 +226,114 @@ def tail_text(path: Path, max_chars: int = 12000) -> str:
     return text[-max_chars:]
 
 
+# Ordered solve pipeline stages mapped to a coarse completion fraction and a
+# human-readable label. The worker appends one JSON record per stage to
+# resources.jsonl; the UI reads the latest record to drive a live progress bar
+# so the user does not have to refresh manually.
+STAGE_PROGRESS = [
+    ("worker_start", 0.02, "Starting worker"),
+    ("geometry_loaded", 0.10, "Geometry loaded"),
+    ("patching_complete", 0.20, "Patching complete"),
+    ("adaptive_rank_complete", 0.28, "Adaptive rank selected"),
+    ("memory_estimate_complete", 0.32, "Memory estimated"),
+    ("block_build_progress", 0.45, "Building Green blocks"),
+    ("model_complete", 0.55, "Model assembled"),
+    ("preconditioner_complete", 0.60, "Preconditioner ready"),
+    ("solve_progress", 0.75, "Solving (Krylov)"),
+    ("gmres_complete", 0.80, "GMRES finished"),
+    ("lgmres_complete", 0.90, "LGMRES fallback finished"),
+    ("metrics_complete", 0.95, "Computing metrics"),
+    ("outputs_saved", 0.99, "Saving outputs"),
+    ("worker_cleanup_complete", 1.0, "Complete"),
+]
+_STAGE_RANK = {name: i for i, (name, _f, _l) in enumerate(STAGE_PROGRESS)}
+_STAGE_INFO = {name: (frac, label) for name, frac, label in STAGE_PROGRESS}
+
+
+def read_progress(job_dir: Path) -> Optional[Dict[str, Any]]:
+    """Parse resources.jsonl and return a coarse progress snapshot.
+
+    Returns a dict with fraction (0..1), label, and the latest raw record, or
+    None when no resource log exists yet. Cheap: only the tail is parsed.
+    """
+    log_path = job_dir / "resources.jsonl"
+    if not log_path.exists():
+        return None
+    try:
+        lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except Exception:
+        return None
+    latest: Optional[Dict[str, Any]] = None
+    best_rank = -1
+    block_fraction: Optional[float] = None
+    solve_record: Optional[Dict[str, Any]] = None
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            record = json.loads(line)
+        except Exception:
+            continue
+        stage = record.get("stage")
+        if stage not in _STAGE_RANK:
+            continue
+        if stage == "block_build_progress":
+            block_fraction = record.get("fraction", block_fraction)
+        if stage == "solve_progress":
+            solve_record = record
+        rank = _STAGE_RANK[stage]
+        if rank >= best_rank:
+            best_rank = rank
+            latest = record
+    if latest is None:
+        return None
+    stage = latest.get("stage")
+    frac, label = _STAGE_INFO.get(stage, (0.0, stage or "working"))
+
+    # Refine within the long phases using sub-progress data.
+    if stage == "block_build_progress" and block_fraction is not None:
+        base, nxt = 0.32, 0.55
+        frac = base + (nxt - base) * float(block_fraction)
+        label = f"Building Green blocks ({block_fraction * 100:.0f}%)"
+    elif stage == "solve_progress" and solve_record is not None:
+        method = solve_record.get("method", "krylov")
+        it = solve_record.get("iteration")
+        res = solve_record.get("current_residual")
+        target = solve_record.get("target_rtol")
+        # Iterative-solver progress has no clean linear endpoint, so estimate it
+        # from how far the residual has dropped toward the target on a log
+        # scale (residual starts near 1.0 and must reach target_rtol). This is
+        # only a visual hint; the bar may pause if convergence stalls.
+        base, nxt = 0.60, 0.80
+        if res is not None and target and res > 0:
+            import math
+            start_exp = 0.0           # log10(1.0)
+            target_exp = math.log10(float(target))
+            cur_exp = math.log10(float(res))
+            span = (start_exp - target_exp) or 1.0
+            done = (start_exp - cur_exp) / span
+            frac = base + (nxt - base) * max(0.0, min(1.0, done))
+        else:
+            frac = base
+        label = f"Solving ({method})"
+        if it is not None:
+            label += f"  iteration {it}"
+        if res is not None:
+            label += f"  residual {res:.2e}"
+            if target:
+                label += f" (target {float(target):.0e})"
+
+    return {
+        "fraction": max(0.0, min(1.0, float(frac))),
+        "label": label,
+        "stage": stage,
+        "elapsed_s": latest.get("elapsed_s"),
+        "rss_mb": latest.get("rss_mb"),
+        "record": latest,
+    }
+
+
 def launch_job(spec_path: Path) -> Dict[str, Any]:
     backend = os.environ.get("DFT_WORKER_BACKEND", "local").strip().lower()
     if backend in {"queue", "shared_queue", "shared-folder"}:
@@ -467,18 +575,48 @@ def render_job(job_dir: Path) -> None:
             st.error(f"Worker state: {state}")
         st.json(status, expanded=False)
 
+    is_active = state in {"submitted", "queued", "running"}
+
+    # Live progress driven by the worker resource log, so the user sees the
+    # solve advancing without manually refreshing.
+    progress = read_progress(job_dir)
+    if progress is not None:
+        if is_active:
+            st.progress(progress["fraction"], text=progress["label"])
+            elapsed = progress.get("elapsed_s")
+            rss = progress.get("rss_mb")
+            bits = []
+            if elapsed is not None:
+                bits.append(f"elapsed {float(elapsed):.0f}s")
+            if rss is not None:
+                bits.append(f"RSS {float(rss):.0f} MiB")
+            if bits:
+                st.caption("Worker active: " + ", ".join(bits))
+        elif progress["stage"] == "worker_cleanup_complete":
+            st.progress(1.0, text="Complete")
+    elif is_active:
+        st.progress(0.0, text="Waiting for the worker to report progress...")
+
     col1, col2 = st.columns(2)
     with col1:
         if st.button("Refresh status", use_container_width=True):
             st.rerun()
     with col2:
         if (
-            state in {"submitted", "queued", "running"}
+            is_active
             and launch.get("backend") == "local_process"
             and st.button("Cancel local worker", use_container_width=True)
         ):
             cancel_local_job(job_dir)
             st.rerun()
+
+    # Auto-refresh loop while the job is still working. This polls the status
+    # and resource log on a fixed cadence so the progress bar advances on its
+    # own; it stops as soon as the job leaves an active state.
+    if is_active:
+        st.caption("Auto-refreshing every 2s while the worker runs.")
+        time.sleep(2.0)
+        st.rerun()
 
     log_text = tail_text(job_dir / "worker.log")
     if log_text:

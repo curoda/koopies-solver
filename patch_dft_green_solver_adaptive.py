@@ -184,6 +184,12 @@ class FeatureMetadata:
     zero_feature_id_is_missing: bool
 
 
+# Public compatibility name used by the feature-aware solver/front-end.
+# FeatureMetadata is the implementation dataclass; both names refer to the
+# same type so existing imports continue to work.
+GeometryFeatures = FeatureMetadata
+
+
 @dataclass
 class Geometry:
     index: np.ndarray
@@ -906,7 +912,7 @@ def load_geometry(
     vn = complex_from_columns(df, "vn")
 
     if all(c in df.columns for c in ["nx", "ny", "nz"]):
-        normals = np.array(df[["nx", "ny", "nz"]].to_numpy(dtype=float))
+        normals = df[["nx", "ny", "nz"]].to_numpy(dtype=float)
         normals /= (np.linalg.norm(normals, axis=1)[:, None] + 1e-15)
         log("Using user-supplied surface normals nx, ny, nz.", verbose)
     else:

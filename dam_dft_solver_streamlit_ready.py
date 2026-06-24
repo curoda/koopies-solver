@@ -1121,12 +1121,29 @@ def solve_pressure(
         )
 
     gmres_residuals: List[float] = []
+    # Throttled live-progress heartbeat so the UI can show that the solve is
+    # actively iterating during the long matrix-free Krylov phase, instead of
+    # appearing frozen between 'preconditioner_complete' and 'gmres_complete'.
+    _progress_state = {"last_emit": 0.0}
+    _progress_interval_s = 2.0
 
     def gmres_callback(value: Any) -> None:
         try:
-            gmres_residuals.append(float(value))
+            res = float(value)
         except Exception:
-            pass
+            return
+        gmres_residuals.append(res)
+        now = time.perf_counter()
+        if now - _progress_state["last_emit"] >= _progress_interval_s:
+            _progress_state["last_emit"] = now
+            monitor.snapshot(
+                "solve_progress",
+                method="gmres",
+                iteration=len(gmres_residuals),
+                maxiter=int(maxiter),
+                current_residual=res,
+                target_rtol=float(rtol),
+            )
 
     log(
         f"Solving by matrix-free GMRES, preconditioner={preconditioner_name}, "
@@ -1177,10 +1194,21 @@ def solve_pressure(
     if (info != 0 or residual > max(10.0 * rtol, 1e-10)) and fallback_krylov == "lgmres":
         log("GMRES did not meet the target; trying matrix-free LGMRES...", verbose)
         lgmres_count = 0
+        _progress_state["last_emit"] = 0.0
 
         def lgmres_callback(_x: np.ndarray) -> None:
             nonlocal lgmres_count
             lgmres_count += 1
+            now = time.perf_counter()
+            if now - _progress_state["last_emit"] >= _progress_interval_s:
+                _progress_state["last_emit"] = now
+                monitor.snapshot(
+                    "solve_progress",
+                    method="lgmres",
+                    iteration=lgmres_count,
+                    maxiter=int(maxiter),
+                    target_rtol=float(rtol),
+                )
 
         started_fallback = time.perf_counter()
         candidate, fallback_info = lgmres(
