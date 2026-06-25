@@ -956,17 +956,46 @@ def build_model_lite(
 
 
 def apply_d_operator(model: SolverModelLite, vector: np.ndarray) -> np.ndarray:
+    """Apply the compressed D operator in three passes.
+
+    Project each source patch once (G_b^H v), translate in the small coefficient
+    space (C_ab), then reconstruct each receiver patch once (G_a d_a). This avoids
+    recomputing the source projection and receiver reconstruction inside the
+    per-block loop, which was an O(B) redundancy per matvec. Arithmetic is
+    identical to the per-block form up to floating-point summation order.
+    """
     result = np.zeros_like(vector, dtype=np.complex128)
+    patches = model.patches
+    n_patches = len(patches)
+
+    # Pass 1: project the input onto every source patch basis exactly once.
+    source_coeff: List[Optional[np.ndarray]] = [None] * n_patches
+    for b_idx, pb in enumerate(patches):
+        basis = pb.basis
+        if basis is not None and basis.shape[1] > 0:
+            source_coeff[b_idx] = basis.conj().T @ vector[pb.indices]
+
+    recv_coeff: List[Optional[np.ndarray]] = [None] * n_patches
     for block in model.d_blocks:
-        pa = model.patches[block.receiver_patch]
-        pb = model.patches[block.source_patch]
-        receiver = pa.indices
-        source = pb.indices
+        pa = patches[block.receiver_patch]
+        pb = patches[block.source_patch]
         if block.kind == "near":
-            result[receiver] += block.matrix @ vector[source]
+            result[pa.indices] += block.matrix @ vector[pb.indices]
         else:
-            source_coeff = pb.basis.conj().T @ vector[source]
-            result[receiver] += pa.basis @ (block.matrix @ source_coeff)
+            c_b = source_coeff[block.source_patch]
+            if c_b is None:
+                continue
+            contrib = block.matrix @ c_b
+            if recv_coeff[block.receiver_patch] is None:
+                recv_coeff[block.receiver_patch] = contrib
+            else:
+                recv_coeff[block.receiver_patch] += contrib
+
+    # Pass 3: reconstruct each receiver patch once.
+    for a_idx, pa in enumerate(patches):
+        d_a = recv_coeff[a_idx]
+        if d_a is not None:
+            result[pa.indices] += pa.basis @ d_a
     return result
 
 
@@ -1121,6 +1150,7 @@ def solve_pressure(
         )
 
     gmres_residuals: List[float] = []
+
     # Throttled live-progress heartbeat so the UI can show that the solve is
     # actively iterating during the long matrix-free Krylov phase, instead of
     # appearing frozen between 'preconditioner_complete' and 'gmres_complete'.
@@ -1194,6 +1224,7 @@ def solve_pressure(
     if (info != 0 or residual > max(10.0 * rtol, 1e-10)) and fallback_krylov == "lgmres":
         log("GMRES did not meet the target; trying matrix-free LGMRES...", verbose)
         lgmres_count = 0
+
         _progress_state["last_emit"] = 0.0
 
         def lgmres_callback(_x: np.ndarray) -> None:

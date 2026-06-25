@@ -89,14 +89,17 @@ import json
 import math
 import os
 import sys
+import time
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Sequence
+from typing import Any, Dict, List, Optional, Tuple, Sequence
 
 import numpy as np
 import pandas as pd
 from scipy.spatial import cKDTree
-from scipy.sparse.linalg import LinearOperator, gmres
+from scipy.sparse.linalg import LinearOperator, gmres, lgmres
+from scipy.linalg import lu_factor, lu_solve, LinAlgWarning
 
 
 # -----------------------------
@@ -1668,65 +1671,249 @@ def build_model(
 
 
 def apply_operator(model: SolverModel, x: np.ndarray, which: str) -> np.ndarray:
-    """Apply S_DFT or D_DFT to vector x using stored patch blocks."""
+    """Apply S_DFT or D_DFT to vector x using stored patch blocks.
+
+    Far blocks are applied in three passes instead of per-block:
+
+      1. PROJECT   each source patch once:   c_b = G_b^H x_b
+      2. TRANSLATE in coefficient space:     d_a += C_ab c_b   (the small cores)
+      3. RECONSTRUCT each receiver patch once: y_a += G_a d_a
+
+    The old code recomputed the source projection ``G_b^H x_b`` and the receiver
+    reconstruction ``G_a (...)`` *inside* the per-block loop, so with B patches
+    each projection/reconstruction was repeated up to B times per matvec. Doing
+    them once per patch removes that O(B) redundancy, which is the dominant
+    matrix-free cost as N (hence B) grows toward tens of thousands of points.
+    The arithmetic is identical up to floating-point summation order.
+    """
     assert which in ("S", "D")
     y = np.zeros_like(x, dtype=np.complex128)
     patches = model.patches
+    B = len(patches)
+
+    # Pass 1: project x onto every source patch basis exactly once.
+    source_coeff: List[Optional[np.ndarray]] = [None] * B
+    for b_idx, pb in enumerate(patches):
+        basis = pb.basis
+        if basis is not None and basis.shape[1] > 0:
+            source_coeff[b_idx] = basis.conj().T @ x[pb.indices]
+
+    # Receiver-side coefficient accumulators, allocated lazily.
+    recv_coeff: List[Optional[np.ndarray]] = [None] * B
+
+    # Single pass over blocks: near blocks act directly; far blocks accumulate
+    # into the receiver coefficient space (no basis multiplies here).
     for block in model.blocks:
-        pa = patches[block.receiver_patch]
-        pb = patches[block.source_patch]
-        I = pa.indices
-        J = pb.indices
         A = block.S if which == "S" else block.D
         if A is None:
             continue
+        a_idx = block.receiver_patch
+        b_idx = block.source_patch
         if block.kind == "near":
-            y[I] += A @ x[J]
+            y[patches[a_idx].indices] += A @ x[patches[b_idx].indices]
         else:
-            # y_a += G_a C_ab G_b^H x_b
-            tmp = pb.basis.conj().T @ x[J]
-            tmp = A @ tmp
-            y[I] += pa.basis @ tmp
+            c_b = source_coeff[b_idx]
+            if c_b is None:
+                continue
+            contrib = A @ c_b
+            if recv_coeff[a_idx] is None:
+                recv_coeff[a_idx] = contrib
+            else:
+                recv_coeff[a_idx] += contrib
+
+    # Pass 3: reconstruct each receiver patch once.
+    for a_idx, pa in enumerate(patches):
+        d_a = recv_coeff[a_idx]
+        if d_a is not None:
+            y[pa.indices] += pa.basis @ d_a
     return y
+
+
+# -----------------------------
+# Block-Jacobi preconditioner (local LU solves, never a global inverse)
+# -----------------------------
+
+@dataclass
+class BlockJacobiPreconditioner:
+    """P^{-1} approximates (1/2 I - D) by its patch-diagonal self blocks only.
+
+    Each patch a contributes A_aa = 1/2 I - D_aa (the dense self block already
+    stored by the solver). We LU-factor each small A_aa once; applying P^{-1}
+    solves these independent local systems. For the second-kind operator this
+    clusters the spectrum and typically cuts GMRES iterations sharply on edged
+    or elongated bodies, while never forming or inverting a global matrix.
+    """
+    factors: List[Tuple[np.ndarray, np.ndarray, np.ndarray]]
+    regularized_patches: List[int]
+
+    def apply(self, vector: np.ndarray) -> np.ndarray:
+        result = np.zeros_like(vector, dtype=np.complex128)
+        for indices, lu, piv in self.factors:
+            result[indices] = lu_solve((lu, piv), vector[indices], check_finite=False)
+        return result
+
+
+def build_block_jacobi_preconditioner(
+    model: SolverModel,
+    regularization: float = 1e-8,
+    verbose: bool = True,
+) -> BlockJacobiPreconditioner:
+    self_blocks = {
+        blk.receiver_patch: blk
+        for blk in model.blocks
+        if blk.receiver_patch == blk.source_patch and blk.kind == "near"
+    }
+    factors: List[Tuple[np.ndarray, np.ndarray, np.ndarray]] = []
+    regularized: List[int] = []
+    for patch_id, patch in enumerate(model.patches):
+        blk = self_blocks.get(patch_id)
+        if blk is None or blk.D is None:
+            raise RuntimeError(f"Missing dense self block for patch {patch_id}.")
+        n_local = len(patch.indices)
+        local_a = 0.5 * np.eye(n_local, dtype=np.complex128) - blk.D
+        needs_reg = False
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always", LinAlgWarning)
+            lu, piv = lu_factor(local_a.copy(), overwrite_a=True, check_finite=False)
+            if any(issubclass(w.category, LinAlgWarning) for w in caught):
+                needs_reg = True
+        diag_abs = np.abs(np.diag(lu))
+        if (not np.all(np.isfinite(diag_abs)) or diag_abs.size == 0
+                or np.min(diag_abs) <= 1e-13 * max(np.max(diag_abs), 1.0)):
+            needs_reg = True
+        if needs_reg:
+            scale = max(float(np.linalg.norm(local_a, ord=np.inf)), 1.0)
+            local_a = local_a + (regularization * scale) * np.eye(n_local, dtype=np.complex128)
+            lu, piv = lu_factor(local_a, overwrite_a=True, check_finite=False)
+            regularized.append(patch_id)
+        factors.append((patch.indices, lu, piv))
+    log(f"Block-Jacobi preconditioner: {len(factors)} local LU factors; "
+        f"regularized patches={len(regularized)}.", verbose)
+    return BlockJacobiPreconditioner(factors, regularized)
+
+
+def estimate_operator_memory(model: SolverModel) -> Dict[str, float]:
+    """Estimate bytes held by the stored operator (near blocks, far cores, bases)."""
+    near_bytes = 0
+    far_bytes = 0
+    for blk in model.blocks:
+        for A in (blk.S, blk.D):
+            if A is None:
+                continue
+            if blk.kind == "near":
+                near_bytes += A.nbytes
+            else:
+                far_bytes += A.nbytes
+    basis_bytes = sum(p.basis.nbytes for p in model.patches if p.basis is not None)
+    total = near_bytes + far_bytes + basis_bytes
+    return {
+        "near_block_bytes": float(near_bytes),
+        "far_core_bytes": float(far_bytes),
+        "basis_bytes": float(basis_bytes),
+        "operator_total_bytes": float(total),
+        "operator_total_gb": float(total / 2**30),
+    }
 
 
 def solve_pressure(
     model: SolverModel,
     rtol: float = 1e-5,
     maxiter: int = 200,
+    restart: int = 50,
+    use_preconditioner: bool = True,
+    precond_regularization: float = 1e-8,
+    fallback: str = "lgmres",
+    mem_limit_gb: Optional[float] = None,
     verbose: bool = True,
 ) -> Tuple[np.ndarray, Dict[str, float]]:
-    """Solve (1/2 I - D)p = i k S vn by GMRES."""
+    """Solve (1/2 I - D)p = i k S vn by (optionally preconditioned) GMRES."""
     vn = model.geom.vn
     rhs = 1j * model.k * apply_operator(model, vn, "S")
     N = len(vn)
+
+    # --- pre-solve diagnostics and memory guard ---
+    mem = estimate_operator_memory(model)
+    krylov_gb = (restart + 2) * N * 16 / 2**30  # complex128 Krylov basis + workspace
+    projected_gb = mem["operator_total_gb"] + krylov_gb
+    log("\n--- Pre-solve diagnostics ---", verbose)
+    log(f"N={N}, patches B={model.B}, near blocks={model.near_blocks}, far blocks={model.far_blocks}", verbose)
+    log(f"Stored operator ~ {mem['operator_total_gb']:.3f} GB "
+        f"(near {mem['near_block_bytes']/2**30:.3f} + far {mem['far_core_bytes']/2**30:.3f} "
+        f"+ bases {mem['basis_bytes']/2**30:.3f}); GMRES Krylov ~ {krylov_gb:.3f} GB; "
+        f"projected peak ~ {projected_gb:.3f} GB", verbose)
+    if mem_limit_gb is not None and projected_gb > mem_limit_gb:
+        raise SystemExit(
+            f"ABORT: projected memory {projected_gb:.2f} GB exceeds --mem-limit-gb "
+            f"{mem_limit_gb:.2f} GB. Reduce N, lower --restart, raise the near "
+            f"threshold, or relax patch resolution."
+        )
 
     def matvec(p: np.ndarray) -> np.ndarray:
         return 0.5 * p - apply_operator(model, p, "D")
 
     Aop = LinearOperator((N, N), matvec=matvec, dtype=np.complex128)
+
+    precond_op = None
+    precond_name = "none"
+    n_reg = 0
+    if use_preconditioner:
+        precond = build_block_jacobi_preconditioner(model, precond_regularization, verbose)
+        precond_op = LinearOperator((N, N), matvec=precond.apply, dtype=np.complex128)
+        precond_name = "block-jacobi"
+        n_reg = len(precond.regularized_patches)
+
     residuals: List[float] = []
 
     def cb(residual):
-        # scipy may pass scalar residual norm for callback_type='pr_norm'.
         try:
             residuals.append(float(residual))
         except Exception:
             pass
 
-    log("Solving closed-body boundary equation by GMRES...", verbose)
+    log(f"Solving by matrix-free GMRES (preconditioner={precond_name}, restart={restart}, maxiter={maxiter})...", verbose)
+    started = time.perf_counter()
     try:
-        p, info = gmres(Aop, rhs, rtol=rtol, atol=0.0, maxiter=maxiter, callback=cb, callback_type="pr_norm")
+        p, info = gmres(Aop, rhs, M=precond_op, rtol=rtol, atol=0.0,
+                        restart=restart, maxiter=maxiter, callback=cb, callback_type="pr_norm")
     except TypeError:
         # Older scipy fallback.
-        p, info = gmres(Aop, rhs, tol=rtol, maxiter=maxiter, callback=cb)
+        p, info = gmres(Aop, rhs, M=precond_op, tol=rtol,
+                        restart=restart, maxiter=maxiter, callback=cb)
+    gmres_seconds = time.perf_counter() - started
 
     res = np.linalg.norm(matvec(p) - rhs) / (np.linalg.norm(rhs) + 1e-30)
+    method_used = "gmres"
+    fb_info = None
     if info == 0:
-        log(f"GMRES converged. Relative residual={res:.3e}, iterations={len(residuals)}", verbose)
+        log(f"GMRES converged. Relative residual={res:.3e}, iterations={len(residuals)}, time={gmres_seconds:.2f}s", verbose)
     else:
         log(f"WARNING: GMRES returned info={info}. Relative residual={res:.3e}, iterations={len(residuals)}", verbose)
-    stats = {"gmres_info": float(info), "relative_residual": float(res), "iterations": float(len(residuals))}
+
+    # Optional LGMRES fallback if GMRES did not meet the target.
+    if (info != 0 or res > max(10.0 * rtol, 1e-10)) and fallback == "lgmres":
+        log("GMRES did not meet target; trying matrix-free LGMRES...", verbose)
+        cand, fb_info = lgmres(Aop, rhs, x0=p, M=precond_op, rtol=rtol, atol=0.0,
+                               maxiter=maxiter, inner_m=max(10, restart), outer_k=3)
+        cand_res = np.linalg.norm(matvec(cand) - rhs) / (np.linalg.norm(rhs) + 1e-30)
+        if cand_res < res:
+            p, res, method_used = cand, cand_res, "lgmres"
+            log(f"LGMRES improved residual to {res:.3e} (info={fb_info}).", verbose)
+        else:
+            log(f"LGMRES did not improve (residual {cand_res:.3e}); keeping GMRES result.", verbose)
+
+    stats = {
+        "gmres_info": float(info),
+        "relative_residual": float(res),
+        "iterations": float(len(residuals)),
+        "method_used": method_used,
+        "preconditioner": precond_name,
+        "restart": int(restart),
+        "regularized_patches": int(n_reg),
+        "fallback_info": (None if fb_info is None else float(fb_info)),
+        "gmres_seconds": float(gmres_seconds),
+        "operator_memory_gb": float(mem["operator_total_gb"]),
+        "projected_peak_gb": float(projected_gb),
+    }
     return p, stats
 
 
@@ -1802,6 +1989,8 @@ def save_outputs(model: SolverModel, p: np.ndarray, stats: Dict[str, float], met
             "If nx,ny,nz or area were not supplied, estimates were used; provide them for production accuracy.",
             "Pressure normalization assumes rho*c = 1. Multiply by rho*c for physical pressure units if velocity is in m/s.",
             "Preprocessor face/edge/corner/feature metadata are carried through and used as hard patch boundaries according to feature_boundary_mode.",
+            "Far blocks are applied in three passes (project/translate/reconstruct) so the source projection and receiver reconstruction are each done once per patch, not once per block.",
+            "GMRES is preconditioned by a block-Jacobi factorization of the patch self blocks (1/2 I - D_aa) unless --no-precond; an LGMRES fallback is tried if GMRES misses tolerance.",
         ],
     }
     report_path = Path(str(out_prefix) + "_report.json")
@@ -1852,6 +2041,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--self-d-model", choices=["zero", "cap"], default="cap", help="Self-cell correction for D operator")
     parser.add_argument("--rtol", type=float, default=1e-5, help="GMRES relative tolerance")
     parser.add_argument("--maxiter", type=int, default=200, help="GMRES maximum iterations")
+    parser.add_argument("--restart", type=int, default=50, help="GMRES restart (Krylov subspace length). Larger = fewer outer cycles, more memory")
+    parser.add_argument("--no-precond", action="store_true", help="Disable the block-Jacobi preconditioner")
+    parser.add_argument("--precond-reg", type=float, default=1e-8, help="Regularization added to singular self blocks in the preconditioner")
+    parser.add_argument("--fallback", choices=["none", "lgmres"], default="lgmres", help="Solver to try if GMRES does not reach tolerance")
+    parser.add_argument("--mem-limit-gb", type=float, default=None, help="Abort before solving if projected peak memory exceeds this many GB")
     parser.add_argument("--out", default="patch_dft_output", help="Output prefix, without extension")
     parser.add_argument("--quiet", action="store_true", help="Reduce console logging")
     parser.add_argument("--make-demo-sphere", type=str, default=None, help="Write a demo pulsating sphere CSV to this path and exit")
@@ -1895,7 +2089,11 @@ def main(argv: Optional[List[str]] = None) -> int:
         m_schedule=parse_m_schedule(args.M_schedule), disable_adaptive_M=args.disable_adaptive_M,
         verbose=verbose,
     )
-    p, stats = solve_pressure(model, rtol=args.rtol, maxiter=args.maxiter, verbose=verbose)
+    p, stats = solve_pressure(
+        model, rtol=args.rtol, maxiter=args.maxiter, restart=args.restart,
+        use_preconditioner=not args.no_precond, precond_regularization=args.precond_reg,
+        fallback=args.fallback, mem_limit_gb=args.mem_limit_gb, verbose=verbose,
+    )
     metrics = compute_outputs(model, p)
     Z = metrics["surface_impedance"]
     log("\n--- Results ---", verbose)
