@@ -915,8 +915,8 @@ def load_geometry(
     vn = complex_from_columns(df, "vn")
 
     if all(c in df.columns for c in ["nx", "ny", "nz"]):
-        normals = df[["nx", "ny", "nz"]].to_numpy(dtype=float)
-        normals /= (np.linalg.norm(normals, axis=1)[:, None] + 1e-15)
+        normals = np.array(df[["nx", "ny", "nz"]].to_numpy(dtype=float))
+        normals = normals / (np.linalg.norm(normals, axis=1)[:, None] + 1e-15)
         log("Using user-supplied surface normals nx, ny, nz.", verbose)
     else:
         log("WARNING: nx, ny, nz not found. Estimating normals by local PCA. ", verbose)
