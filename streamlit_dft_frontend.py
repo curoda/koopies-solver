@@ -414,7 +414,8 @@ def create_job(
     feature_metadata_file: Any,
     preset: Optional[Dict[str, Any]],
     case_id: str,
-    frequency_hz: float,
+    frequency_hz: Optional[float],
+    ka: Optional[float],
     a: float,
     rho: float,
     c: float,
@@ -485,8 +486,12 @@ def create_job(
         str(input_path),
         "--case-id",
         case_id,
-        "--frequency-hz",
-        str(frequency_hz),
+    ]
+    if ka is not None:
+        command += ["--ka", str(ka)]
+    else:
+        command += ["--frequency-hz", str(frequency_hz)]
+    command += [
         "--a",
         str(a),
         "--rho",
@@ -737,7 +742,15 @@ with st.form("new_job", clear_on_submit=False):
     left, right = st.columns(2)
     with left:
         case_id = st.text_input("Case ID", value="pitch")
+        freq_mode = st.radio(
+            "Excitation input",
+            ["Frequency (Hz)", "ka (dimensionless)"],
+            index=0,
+            horizontal=True,
+            help="Frequency mode computes ka = (2*pi*f/c)*a. ka mode sets ka directly (k = ka/a).",
+        )
         frequency_hz = st.number_input("Frequency (Hz)", min_value=0.001, value=276.17, format="%.6f")
+        ka_value = st.number_input("ka", min_value=0.0001, value=1.0, format="%.6f")
         a = st.number_input("Reference length a (m)", min_value=1e-9, value=0.225, format="%.9f")
         rho = st.number_input("Air density rho (kg/m³)", min_value=0.001, value=1.204, format="%.6f")
         c = st.number_input("Sound speed c (m/s)", min_value=1.0, value=343.0, format="%.6f")
@@ -852,7 +865,8 @@ if submitted:
             feature_metadata_file=feature_metadata_upload,
             preset=preset,
             case_id=case_id,
-            frequency_hz=float(frequency_hz),
+            frequency_hz=(None if freq_mode == "ka (dimensionless)" else float(frequency_hz)),
+            ka=(float(ka_value) if freq_mode == "ka (dimensionless)" else None),
             a=float(a),
             rho=float(rho),
             c=float(c),
