@@ -27,6 +27,9 @@ from typing import Any, Dict, Optional
 
 import streamlit as st
 
+import patch_dft_green_solver as legacy
+from prolate_spheroid import write_prolate_csv
+
 HERE = Path(__file__).resolve().parent
 SOLVER = HERE / "dam_dft_solver_streamlit_ready.py"
 WRAPPER = HERE / "dft_worker_job.py"
@@ -409,6 +412,7 @@ def cancel_local_job(job_dir: Path) -> None:
 def create_job(
     uploaded_file: Any,
     feature_metadata_file: Any,
+    preset: Optional[Dict[str, Any]],
     case_id: str,
     frequency_hz: float,
     a: float,
@@ -446,8 +450,29 @@ def create_job(
     job_id = f"{stamp}_{safe_name(case_id)}_{uuid.uuid4().hex[:8]}"
     job_dir = JOB_ROOT / job_id
     job_dir.mkdir(parents=True, exist_ok=False)
-    input_path = job_dir / safe_name(uploaded_file.name)
-    input_path.write_bytes(uploaded_file.getvalue())
+    if preset is not None:
+        input_path = job_dir / f"{safe_name(preset['kind'])}_input.csv"
+        if preset["kind"] == "pulsating_sphere":
+            legacy.write_demo_sphere_csv(
+                input_path,
+                n=int(preset["n"]),
+                radius=float(preset["radius"]),
+                verbose=False,
+            )
+        elif preset["kind"] == "prolate_spheroid":
+            write_prolate_csv(
+                input_path,
+                n=int(preset["n"]),
+                a_center=float(preset["a_center"]),
+                ratio=float(preset["ratio"]),
+                w_multiplier=int(preset["W"]),
+                verbose=False,
+            )
+        else:
+            raise ValueError(f"Unknown preset kind: {preset['kind']}")
+    else:
+        input_path = job_dir / safe_name(uploaded_file.name)
+        input_path.write_bytes(uploaded_file.getvalue())
     feature_metadata_path: Optional[Path] = None
     if feature_metadata_file is not None:
         feature_metadata_path = job_dir / safe_name(feature_metadata_file.name)
@@ -686,7 +711,29 @@ st.title("DAM feature-aware patch-DFT acoustic solver")
 st.caption("One mode per isolated worker process; preprocessor-aware patching; matrix-free preconditioned Krylov solution; no explicit matrix inversion.")
 
 with st.form("new_job", clear_on_submit=False):
+    geometry_source = st.radio(
+        "Geometry source",
+        ["Upload CSV", "Pulsating sphere (built-in)", "Prolate spheroid 1:5 (built-in)"],
+        index=0,
+        horizontal=True,
+        help="Built-in generators produce a solver-ready pulsating geometry CSV; no upload needed.",
+    )
     uploaded = st.file_uploader("One mode CSV", type=["csv"])
+    with st.expander("Built-in geometry parameters", expanded=False):
+        st.caption("Used only when a built-in geometry source is selected above.")
+        g1, g2, g3 = st.columns(3)
+        preset_n = g1.number_input("Surface points N", min_value=16, value=1440, step=16)
+        preset_radius = g2.number_input(
+            "Sphere radius (m)", min_value=1e-9, value=1.0, format="%.6f"
+        )
+        preset_b = g3.number_input(
+            "Spheroid equatorial b = a_center (m)", min_value=1e-9, value=1.0, format="%.6f"
+        )
+        g4, g5 = st.columns(2)
+        preset_ratio = g4.number_input(
+            "Spheroid major:minor ratio", min_value=1.0, value=5.0, step=0.5
+        )
+        preset_W = g5.number_input("Spheroid W multiplier", min_value=1, value=1, step=1)
     left, right = st.columns(2)
     with left:
         case_id = st.text_input("Case ID", value="pitch")
@@ -784,12 +831,26 @@ with st.form("new_job", clear_on_submit=False):
     submitted = st.form_submit_button("Submit one mode to worker", type="primary")
 
 if submitted:
-    if uploaded is None:
-        st.error("Upload one mode CSV before submitting.")
+    if geometry_source == "Pulsating sphere (built-in)":
+        preset = {"kind": "pulsating_sphere", "n": preset_n, "radius": preset_radius}
+    elif geometry_source == "Prolate spheroid 1:5 (built-in)":
+        preset = {
+            "kind": "prolate_spheroid",
+            "n": preset_n,
+            "a_center": preset_b,
+            "ratio": preset_ratio,
+            "W": preset_W,
+        }
+    else:
+        preset = None
+
+    if preset is None and uploaded is None:
+        st.error("Upload one mode CSV or pick a built-in geometry source before submitting.")
     else:
         job_dir = create_job(
             uploaded_file=uploaded,
             feature_metadata_file=feature_metadata_upload,
+            preset=preset,
             case_id=case_id,
             frequency_hz=float(frequency_hz),
             a=float(a),
