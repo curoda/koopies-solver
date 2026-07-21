@@ -324,19 +324,19 @@ def main() -> None:
     parser.add_argument(
         "--stage67-dir",
         type=Path,
-        default=Path("/mnt/data/DAM_CATS_EYE_Stage67_CatEyeResonanceAwareRetry"),
+        default=Path("DAM_CATS_EYE_Stage67_CatEyeResonanceAwareRetry"),
         help="Optional extracted Stage-67 directory.",
     )
     parser.add_argument(
         "--stage67-zip",
         type=Path,
-        default=Path("/mnt/data/DAM_CATS_EYE_Stage67_CatEyeResonanceAwareRetry.zip"),
+        default=Path("DAM_CATS_EYE_Stage67_CatEyeResonanceAwareRetry.zip"),
         help="Stage-67 ZIP package.",
     )
     parser.add_argument(
         "--out",
         type=Path,
-        default=Path("/mnt/data/DAM_CATS_EYE_Stage68_CatEyePromotionalComparison"),
+        default=Path("DAM_CATS_EYE_Stage68_CatEyePromotionalComparison"),
         help="Output directory.",
     )
     args = parser.parse_args()
