@@ -137,6 +137,17 @@ def render_pressure_viewer(job_dir: Path) -> None:
             "Color by", color_options, index=0, key=f"colorby_{job_dir.name}",
         )
 
+    # Per-case color range: min -> max of |p| for THIS case, so the scale
+    # is tight to the data instead of an absolute/global range.
+    p_finite = p_abs[np.isfinite(p_abs)]
+    if p_finite.size:
+        p_cmin = float(np.min(p_finite))
+        p_cmax = float(np.max(p_finite))
+    else:
+        p_cmin, p_cmax = 0.0, 1.0
+    if p_cmax <= p_cmin:
+        p_cmax = p_cmin + 1e-12
+
     if color_by == "|p| (Pa)":
         color_values = p_abs
         colorscale = "Viridis"
@@ -167,6 +178,7 @@ def render_pressure_viewer(job_dir: Path) -> None:
                 x=xyz[:, 0], y=xyz[:, 1], z=xyz[:, 2],
                 i=tris[:, 0], j=tris[:, 1], k=tris[:, 2],
                 intensity=p_abs, colorscale="Viridis",
+                cmin=p_cmin, cmax=p_cmax,
                 colorbar=dict(title="|p| (Pa)"), showscale=True,
                 opacity=1.0, flatshading=False,
                 lighting=dict(ambient=0.55, diffuse=0.6, specular=0.2,
@@ -196,6 +208,8 @@ def render_pressure_viewer(job_dir: Path) -> None:
                 mode="markers",
                 marker=dict(
                     size=3, color=color_values, colorscale=colorscale,
+                    cmin=(p_cmin if not discrete else None),
+                    cmax=(p_cmax if not discrete else None),
                     colorbar=(None if discrete else dict(title=colorbar_title)),
                     showscale=not discrete,
                 ),
