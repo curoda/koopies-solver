@@ -137,12 +137,20 @@ def render_pressure_viewer(job_dir: Path) -> None:
             "Color by", color_options, index=0, key=f"colorby_{job_dir.name}",
         )
 
-    # Per-case color range: min -> max of |p| for THIS case, so the scale
-    # is tight to the data instead of an absolute/global range.
+    # Per-case color range for |p|. A percentile clamp keeps one hot patch
+    # from stretching the scale and washing out the rest of the surface.
+    lo_pct, hi_pct = st.slider(
+        "|p| color range (percentile clamp)",
+        min_value=0.0, max_value=100.0, value=(2.0, 98.0), step=0.5,
+        key=f"pctclamp_{job_dir.name}",
+        help="Clamps the color scale to this percentile band of |p| for this "
+             "case. Set to 0-100 for raw min-max.",
+    )
+
     p_finite = p_abs[np.isfinite(p_abs)]
     if p_finite.size:
-        p_cmin = float(np.min(p_finite))
-        p_cmax = float(np.max(p_finite))
+        p_cmin = float(np.percentile(p_finite, lo_pct))
+        p_cmax = float(np.percentile(p_finite, hi_pct))
     else:
         p_cmin, p_cmax = 0.0, 1.0
     if p_cmax <= p_cmin:
